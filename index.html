@@ -1,0 +1,142 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>AGB-EMU · Game Boy Advance</title>
+  <meta name="description" content="A from-scratch Game Boy Advance emulator running in your browser." />
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect x='1' y='3' width='14' height='10' rx='3' fill='%2356509f'/%3E%3Crect x='4' y='5' width='8' height='6' rx='1' fill='%230b0913'/%3E%3Ccircle cx='13' cy='6.5' r='1' fill='%23e0496b'/%3E%3C/svg%3E" />
+</head>
+<body>
+  <div class="page">
+    <header class="topbar">
+      <div class="brand">
+        <span class="brand-mark">AGB<em>·</em>EMU</span>
+        <span class="brand-sub">from-scratch ARM7TDMI core</span>
+      </div>
+      <div class="top-status">
+        <span id="biosStatus" class="chip" title="BIOS source">HLE BIOS</span>
+        <button id="biosBtn" class="chip chip-btn" type="button" title="Load a real gba_bios.bin (optional)">LOAD BIOS</button>
+        <span id="padStatus" class="chip">NO CONTROLLER</span>
+        <button id="audioBtn" class="chip chip-btn" type="button" title="Toggle sound">SOUND OFF</button>
+        <span id="fps" class="chip chip-fps">-- fps</span>
+      </div>
+      <input id="biosInput" type="file" accept=".bin" hidden />
+      <input id="romInput" type="file" accept=".gba,.agb,.bin" hidden />
+    </header>
+
+    <main class="stage">
+      <!-- Cartridge slot -->
+      <div class="slot-area">
+        <div id="cart" class="cart" hidden>
+          <div class="cart-ridge"></div>
+          <div class="cart-label">
+            <span id="cartTitle">CARTRIDGE</span>
+            <span id="cartMeta" class="cart-meta"></span>
+          </div>
+        </div>
+        <button id="dropzone" class="slot" type="button">
+          <span class="slot-mouth"></span>
+          <span id="slotHint" class="slot-hint">DROP A .GBA FILE &nbsp;·&nbsp; CLICK TO BROWSE</span>
+        </button>
+      </div>
+
+      <!-- Console shell -->
+      <div class="console" id="consoleEl">
+        <div class="shell">
+          <div class="shell-topline"></div>
+
+          <div class="face">
+            <div class="dpad" id="dpad">
+              <button class="dp up"    data-bit="64"  aria-label="Up"></button>
+              <button class="dp left"  data-bit="32"  aria-label="Left"></button>
+              <button class="dp mid"   aria-hidden="true" tabindex="-1"></button>
+              <button class="dp right" data-bit="16"  aria-label="Right"></button>
+              <button class="dp down"  data-bit="128" aria-label="Down"></button>
+            </div>
+
+            <div class="lens-wrap">
+              <div class="led-row">
+                <span id="powerLed" class="led"></span>
+                <span class="led-label">POWER</span>
+              </div>
+              <div class="lens">
+                <canvas id="screen" width="240" height="160"></canvas>
+                <div id="crt" class="crt"></div>
+                <div id="screenMsg" class="screen-msg"></div>
+              </div>
+              <div class="lens-word">GAME BOY <em>ADVANCE</em></div>
+            </div>
+
+            <div class="ab">
+              <button class="abtn b" data-bit="2" aria-label="B button"><span>B</span></button>
+              <button class="abtn a" data-bit="1" aria-label="A button"><span>A</span></button>
+            </div>
+          </div>
+
+          <div class="face-bottom">
+            <div class="ss">
+              <button class="ssbtn" data-bit="4" aria-label="Select"><span>SELECT</span></button>
+              <button class="ssbtn" data-bit="8" aria-label="Start"><span>START</span></button>
+            </div>
+            <div class="grille" aria-hidden="true">
+              <i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i>
+            </div>
+          </div>
+          <div class="shoulder l" id="shoulderL" data-bit="512">L</div>
+          <div class="shoulder r" id="shoulderR" data-bit="256">R</div>
+        </div>
+      </div>
+
+      <!-- Control deck -->
+      <div class="deck">
+        <button id="pauseBtn"  class="dbtn" type="button" disabled>PAUSE</button>
+        <button id="resetBtn"  class="dbtn" type="button" disabled>RESET</button>
+        <button id="speedBtn"  class="dbtn" type="button" disabled>1× SPEED</button>
+        <button id="crtBtn"    class="dbtn" type="button">CRT: ON</button>
+        <button id="fsBtn"     class="dbtn" type="button">FULLSCREEN</button>
+        <button id="ejectBtn"  class="dbtn dbtn-warn" type="button" disabled>EJECT</button>
+      </div>
+
+      <!-- Manual-style panels -->
+      <section class="panels">
+        <div class="panel">
+          <h2>Controls</h2>
+          <ul class="keymap">
+            <li><span class="keys"><kbd>↑</kbd><kbd>←</kbd><kbd>↓</kbd><kbd>→</kbd></span><span>D-Pad</span></li>
+            <li><span class="keys"><kbd>X</kbd></span><span>A button</span></li>
+            <li><span class="keys"><kbd>Z</kbd></span><span>B button</span></li>
+            <li><span class="keys"><kbd>A</kbd><kbd>S</kbd></span><span>L / R</span></li>
+            <li><span class="keys"><kbd>↵</kbd></span><span>Start</span></li>
+            <li><span class="keys"><kbd>⇧</kbd></span><span>Select</span></li>
+            <li><span class="keys"><kbd>Space</kbd></span><span>Fast-forward (hold)</span></li>
+            <li><span class="keys"><kbd>F1</kbd> <kbd>F2</kbd></span><span>Quick save / load</span></li>
+          </ul>
+          <p class="panel-note">Any standard gamepad works: south&nbsp;=&nbsp;B, east&nbsp;=&nbsp;A, shoulders&nbsp;=&nbsp;L/R.</p>
+        </div>
+
+        <div class="panel">
+          <h2>Save states</h2>
+          <div id="stateSlots" class="slots">
+            <p class="panel-note">Insert a cartridge to use save states.</p>
+          </div>
+        </div>
+
+        <div class="panel">
+          <h2>Library</h2>
+          <div id="library" class="library">
+            <p class="panel-note">ROMs you load are kept in this browser.</p>
+          </div>
+        </div>
+      </section>
+    </main>
+
+    <footer class="foot">
+      <span>Runs entirely in your browser. No ROMs are uploaded anywhere.</span>
+      <span class="foot-dim">Only load games you own.</span>
+    </footer>
+  </div>
+  <div id="toast" class="toast" hidden></div>
+  <script type="module" src="/src/main.ts"></script>
+</body>
+</html>

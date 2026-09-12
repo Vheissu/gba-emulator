@@ -218,7 +218,7 @@ export class GBA {
     const view = new DataView(buf);
     if (bytes.length < 12 || view.getUint32(0, true) !== 0x47424153) return false;
     let off = 12;
-    const take = (n: number) => { const s = bytes.subarray(off, off + n); off += n; return s; };
+    const take = (n: number) => { const s = bytes.slice(off, off + n); off += n; return s; };
     this.cpu.r.set(new Int32Array(take(64).buffer.slice(0) as ArrayBuffer));
     const c = new Int32Array(take(12).buffer.slice(0) as ArrayBuffer);
     this.cpu.cpsr = c[0];
