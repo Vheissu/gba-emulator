@@ -9,6 +9,7 @@
 
 import { Bus } from "./bus";
 import { CPU, MODE_SYS, MODE_IRQ, MODE_SVC } from "./cpu";
+import type { System } from "./system";
 
 // ---------------------------------------------------------------------------
 // Synthetic BIOS image
@@ -41,7 +42,7 @@ export function buildSyntheticBios(): Uint8Array {
 
   // Reset stub at 0x30: jump to 0x08000000 (skips nothing else; machine
   // normally bypasses BIOS entirely).
-  w(0x30, 0xe3a0f402); // mov pc, #0x08000000  (imm 8 ror 24 -> rot field 12)
+  w(0x30, 0xe3a0f302); // mov pc, #0x08000000  (0x02 ror 6)
   w(0x34, 0xeafffffe); // b .
 
   // IRQ shim at 0x40.
@@ -51,7 +52,7 @@ export function buildSyntheticBios(): Uint8Array {
     0xe1d010b2, // ldrh r1, [r0, #2]     IF
     0xe1d020b0, // ldrh r2, [r0]         IE
     0xe0011002, // and r1, r1, r2        received = IE & IF
-    0xe59f2028, // ldr r2, [pc, #0x28]   -> 0x03007FF8
+    0xe59f202c, // ldr r2, [pc, #0x2c]   -> 0x03007FF8
     0xe1d230b0, // ldrh r3, [r2]
     0xe1833001, // orr r3, r3, r1
     0xe1c230b0, // strh r3, [r2]
@@ -65,7 +66,7 @@ export function buildSyntheticBios(): Uint8Array {
 
   // Literal pool: pc during exec = instrAddr + 8.
   // ldr r0 at 0x44: pc=0x4c -> target 0x4c+0x34 = 0x80.
-  // ldr r2 at 0x58: pc=0x60 -> target 0x60+0x28 = 0x88.
+  // ldr r2 at 0x54: pc=0x5c -> target 0x5c+0x2c = 0x88.
   w(0x80, 0x04000200);
   w(0x88, 0x03007ff8);
 
@@ -79,6 +80,7 @@ export function buildSyntheticBios(): Uint8Array {
 export class BiosHLE {
   cpu!: CPU;
   bus!: Bus;
+  sys!: System;
 
   /** IntrWait bookkeeping. */
   intrWaitFlags = 0;
@@ -165,18 +167,17 @@ export class BiosHLE {
     if (!this.intrWaiting) return;
     const flags = this.rd16(0x03007ff8);
     if ((flags & this.intrWaitFlags) !== 0) {
-      if (this.intrWaitDiscard) this.wr16(0x03007ff8, flags & ~this.intrWaitFlags);
       this.intrWaiting = false;
+      if (this.intrWaitDiscard) this.wr16(0x03007ff8, flags & ~this.intrWaitFlags);
       this.cpu.halted = false;
     }
   }
 
   private intrWait(discard: number, target: number): void {
     const flags = this.rd16(0x03007ff8);
-    if ((flags & target) !== 0) {
-      if (discard) this.wr16(0x03007ff8, flags & ~target);
-      return;
-    }
+    if (!discard && (flags & target) !== 0) return;
+    this.wr16(0x03007ff8, flags & ~target);
+    this.sys.ime = 1;
     this.intrWaitFlags = target;
     this.intrWaitDiscard = discard;
     this.intrWaiting = true;

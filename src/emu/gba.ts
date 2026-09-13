@@ -43,15 +43,18 @@ export class GBA {
     this.ppu.oam = this.bus.oam;
     this.biosHle.cpu = this.cpu;
     this.biosHle.bus = this.bus;
+    this.biosHle.sys = this.sys;
 
     this.bus.devices = [this.sys, this.ppu, this.apu];
     this.bus.addCycles = (n) => { this.cycles += n; };
 
     this.cpu.irqLine = () => this.sys.irqLine();
+    this.cpu.haltWake = () => this.sys.haltWake();
     this.cpu.swiHandler = (n) => this.biosHle.swi(n);
 
     this.ppu.requestIrq = (bit) => this.sys.requestIrq(bit);
     this.sys.onIrqFired = () => this.biosHle.checkIntrWait();
+    this.bus.onIntrFlagsWritten = () => this.biosHle.checkIntrWait();
     this.ppu.onVBlank = () => {
       this.sys.dmaTrigger(1);
       this.frameDone = true;

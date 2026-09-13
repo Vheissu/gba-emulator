@@ -30,6 +30,8 @@ export class CPU {
   /** HLE SWI dispatch; only used when no BIOS image is loaded. */
   swiHandler: (num: number) => void = () => {};
   irqLine: () => boolean = () => false;
+  /** Halt wake condition: IE & IF (IME does not gate waking). */
+  haltWake: () => boolean = () => false;
   biosPresent = false;
   halted = false;
 
@@ -227,7 +229,7 @@ export class CPU {
   step(): void {
     if (this.halted) {
       this.bus.internal(1);
-      if (this.irqLine()) this.halted = false;
+      if (this.haltWake()) this.halted = false;
       else return;
     }
     if (!(this.cpsr & I) && this.irqLine()) {

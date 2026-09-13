@@ -277,16 +277,17 @@ export class APU implements BusDevice {
         this.fifoASample = this.fifoA[this.fifoAHead];
         this.fifoAHead = (this.fifoAHead + 1) & 31;
         this.fifoALen--;
-        if (this.fifoALen <= 16) this.fifoARequest();
       }
+      // FIFO request is level-sensitive: DMA refills whenever <=16 bytes.
+      if (this.fifoALen <= 16 && (this.cntH & 0x0300)) this.fifoARequest();
     }
     if (t === ((this.cntH >>> 14) & 1)) {
       if (this.fifoBLen > 0) {
         this.fifoBSample = this.fifoB[this.fifoBHead];
         this.fifoBHead = (this.fifoBHead + 1) & 31;
         this.fifoBLen--;
-        if (this.fifoBLen <= 16) this.fifoBRequest();
       }
+      if (this.fifoBLen <= 16 && (this.cntH & 0x3000)) this.fifoBRequest();
     }
   }
 

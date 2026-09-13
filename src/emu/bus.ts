@@ -43,6 +43,11 @@ export class Bus {
   devices: BusDevice[] = [];
   addCycles: (n: number) => void = () => {};
 
+  /** Fired when the BIOS interrupt-flag mirror (0x03007FF8) is written —
+   *  e.g. by the IRQ shim. Lets the HLE IntrWait consume flags at the same
+   *  point the real BIOS loop would see them. */
+  onIntrFlagsWritten: () => void = () => {};
+
   // Save hardware hooks (installed by save.ts).
   sramRead: (addr: number) => number = () => 0xff;
   sramWrite: (addr: number, value: number) => void = () => {};
@@ -165,7 +170,10 @@ export class Bus {
     value &= 0xff;
     switch ((addr >>> 24) & 0xf) {
       case 0x2: this.ewram[addr & 0x3ffff] = value; return;
-      case 0x3: this.iwram[addr & 0x7fff] = value; return;
+      case 0x3:
+        this.iwram[addr & 0x7fff] = value;
+        if ((addr & 0x7ffe) === 0x7ff8) this.onIntrFlagsWritten();
+        return;
       case 0x4: this.ioWrite8(addr & 0x7ff, value); return;
       case 0x5: {
         const o = addr & 0x3fe;

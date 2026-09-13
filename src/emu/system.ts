@@ -31,7 +31,6 @@ export class System implements BusDevice {
   // internal working regs
   private dmaSrc = new Uint32Array(4);
   private dmaDst = new Uint32Array(4);
-  private dmaCount = new Uint32Array(4);
   private dmaRunning = [false, false, false, false];
 
   // Keypad
@@ -55,6 +54,11 @@ export class System implements BusDevice {
 
   irqLine(): boolean {
     return this.ime === 1 && (this.ie & this.if_) !== 0;
+  }
+
+  /** CPU wakes from HALT on any IE&IF match, regardless of IME. */
+  haltWake(): boolean {
+    return (this.ie & this.if_) !== 0;
   }
 
   requestIrq(bit: number): void {
@@ -171,11 +175,8 @@ export class System implements BusDevice {
 
     let src = this.dmaSrc[ch];
     let dst = this.dmaDst[ch];
-    let count = this.dmaCount[ch];
-    if (timing === 0 || count === 0) {
-      // Immediate mode (or first trigger after enable) uses the full count.
-      if (timing === 0) count = this.dmaMaxCount(ch);
-    }
+    // Every trigger transfers the full word count.
+    const count = this.dmaMaxCount(ch);
 
     const step = is32 ? 4 : 2;
     for (let i = 0; i < count; i++) {
@@ -205,7 +206,6 @@ export class System implements BusDevice {
     if (dadAdj === 3) dst = this.dmaDad[ch];
     this.dmaSrc[ch] = src;
     this.dmaDst[ch] = dst;
-    this.dmaCount[ch] = count;
 
     if (cntH & 0x4000) this.requestIrq(8 + ch);
 
@@ -213,8 +213,6 @@ export class System implements BusDevice {
       // Done: clear enable.
       this.dmaCntH[ch] &= 0x7fff;
       this.dmaRunning[ch] = false;
-    } else {
-      this.dmaCount[ch] = 0; // reload on next trigger
     }
     this.bus.internal(2);
   }
@@ -289,7 +287,6 @@ export class System implements BusDevice {
             if (!wasOn && (value & 0x8000)) {
               this.dmaSrc[ch] = this.dmaSad[ch];
               this.dmaDst[ch] = this.dmaDad[ch];
-              this.dmaCount[ch] = 0;
               this.dmaEnable(ch);
             }
             break;
