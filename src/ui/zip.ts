@@ -2,6 +2,7 @@
 // built-in inflate.
 
 const ROM_EXT = /\.(gba|agb|bin)$/i;
+const MAX_SIZE = 32 * 1024 * 1024; // largest GBA cartridge
 
 export function isZip(data: Uint8Array): boolean {
   return data.length > 4 && data[0] === 0x50 && data[1] === 0x4b && data[2] === 0x03 && data[3] === 0x04;
@@ -20,13 +21,14 @@ export async function extractRom(zip: Uint8Array): Promise<{ name: string; data:
     if (view.getUint32(pos, true) !== 0x02014b50) return null;
     const method = view.getUint16(pos + 10, true);
     const packedSize = view.getUint32(pos + 20, true);
+    const size = view.getUint32(pos + 24, true);
     const nameLen = view.getUint16(pos + 28, true);
     const extraLen = view.getUint16(pos + 30, true);
     const commentLen = view.getUint16(pos + 32, true);
     const local = view.getUint32(pos + 42, true);
     const name = new TextDecoder().decode(zip.subarray(pos + 46, pos + 46 + nameLen));
     pos += 46 + nameLen + extraLen + commentLen;
-    if (!ROM_EXT.test(name)) continue;
+    if (!ROM_EXT.test(name) || size > MAX_SIZE) continue;
 
     const dataStart = local + 30 + view.getUint16(local + 26, true) + view.getUint16(local + 28, true);
     const packed = zip.subarray(dataStart, dataStart + packedSize);
