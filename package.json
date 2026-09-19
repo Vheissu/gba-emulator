@@ -6,7 +6,8 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc --noEmit && vite build",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "test": "tsx tools/suite.mts"
   },
   "devDependencies": {
     "playwright-core": "^1.63.0",
