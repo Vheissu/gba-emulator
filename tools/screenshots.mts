@@ -27,8 +27,8 @@ async function shootConsole(name: string): Promise<void> {
   await page.screenshot({
     path: `${OUT}/${name}.png`,
     clip: {
-      x: shell.x - pad, y: top.y - pad,
-      width: shell.width + pad * 2, height: deck.y + deck.height - top.y + pad + 16,
+      x: shell.x - pad, y: top.y - 8,
+      width: shell.width + pad * 2, height: deck.y + deck.height - top.y + 8 + 16,
     },
   });
 }
@@ -36,9 +36,7 @@ async function shootConsole(name: string): Promise<void> {
 await page.goto(URL, { waitUntil: "networkidle" });
 await page.waitForTimeout(700);
 await page.locator("#romInput").setInputFiles(ROM);
-await page.waitForTimeout(5200);           // title screen
-await page.locator("#toast").evaluate((t) => { (t as HTMLElement).hidden = true; });
-await shootConsole("title");
+await page.waitForTimeout(5200);           // sit through the title fade-in
 
 await tap(page, "Enter");                  // start the game
 await page.waitForTimeout(4200);
