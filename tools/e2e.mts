@@ -59,15 +59,49 @@ await page.locator("#pauseBtn").click();
 // Eject -> back to idle.
 await page.locator("#ejectBtn").click();
 await page.waitForTimeout(800);
-const ejectedHash = await screenHash();
+// The idle screen blinks, so give it a full cycle to match the first capture.
+let ejectedHash = await screenHash();
+for (let i = 0; i < 30 && ejectedHash !== idleHash; i++) {
+  await page.waitForTimeout(50);
+  ejectedHash = await screenHash();
+}
 await page.screenshot({ path: "shot-ejected.png", fullPage: true });
 
+// Rewind: play on, hold Backspace, and the picture should change while
+// the REWIND banner shows.
+await page.locator("#romInput").setInputFiles(ROM);
+await page.waitForTimeout(2500);
+await page.keyboard.down("Backspace");
+await page.waitForTimeout(200);
+const rewindBanner = await page.locator("#screenMsg").textContent();
+await page.keyboard.up("Backspace");
+
+// Rebind A to K, then restore defaults.
+await page.locator("#keymap .kbd-btn").first().click();
+await page.keyboard.press("KeyK");
+const rebound = await page.locator("#keymap .kbd-btn").first().textContent();
+await page.locator("#keysReset").click();
+
+// Settings persist across reloads.
+await page.locator("#optCrt").uncheck();
+const crtHidden = await page.locator("#crt.off").count();
+
+// Cheats parse and report.
+await page.locator("#cheatText").fill("02000000:63\nnot a code");
+await page.locator("#cheatApply").click();
+const cheatStatus = await page.locator("#cheatStatus").textContent();
+await page.locator("#cheatText").fill("");
+await page.locator("#cheatApply").click();
+await page.locator("#optCrt").check();
+
+await page.waitForTimeout(1200);
 const fps = await page.locator("#fps").textContent();
 const cartTitle = await page.locator("#cartTitle").textContent();
 const libCount = await page.locator(".rom-row").count();
 
 console.log(JSON.stringify({
   fps, cartTitle, ledPaused, slotHasThumb, libCount,
+  rewindBanner, rebound, crtHidden, cheatStatus,
   idleHash, menuHash, testHash, ejectedHash,
   menuChanged: menuHash !== idleHash,
   startWorked: testHash !== menuHash,

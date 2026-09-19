@@ -1,5 +1,6 @@
 node_modules/
 dist/
 *.png
+!docs/screenshots/*.png
 *.local
 .DS_Store
