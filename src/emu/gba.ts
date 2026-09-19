@@ -1,14 +1,23 @@
-// The GBA machine: wires CPU + bus + PPU + APU + system IO + saves + BIOS.
+// The GBA machine: wires CPU + bus + PPU + APU + system IO + saves + BIOS
+// and owns the frame loop.
 
 import { Bus } from "./bus";
 import { CPU } from "./cpu";
 import { PPU } from "./ppu";
 import { APU } from "./apu";
-import { System } from "./system";
+import { System, DmaTiming } from "./system";
+import { Gpio } from "./gpio";
 import { BiosHLE, buildSyntheticBios } from "./bios";
 import { SaveDevice, SaveKind, createSave, detectSaveKind } from "./saves";
+import { StateReader, StateWriter } from "./state";
 
+export const CPU_HZ = 16777216;
 export const CYCLES_PER_FRAME = 280896;
+export const FRAME_MS = (CYCLES_PER_FRAME / CPU_HZ) * 1000;
+
+const BIOS_SIZE = 0x4000;
+const STATE_MAGIC = 0x53424741; // "AGBS"
+const STATE_VERSION = 2;
 
 export interface RomInfo {
   title: string;
@@ -17,251 +26,187 @@ export interface RomInfo {
   saveKind: SaveKind;
 }
 
+/** A RAM patch applied once per frame (cheat codes). */
+export interface Patch {
+  addr: number;
+  value: number;
+  /** Bytes to write: 1, 2 or 4. */
+  size: number;
+}
+
 export class GBA {
-  bus = new Bus();
-  cpu = new CPU();
-  ppu = new PPU();
-  apu = new APU();
-  sys = new System();
-  biosHle = new BiosHLE();
+  readonly bus = new Bus();
+  readonly cpu = new CPU();
+  readonly ppu = new PPU();
+  readonly apu = new APU();
+  readonly sys = new System();
+  readonly gpio = new Gpio();
+  private readonly biosHle = new BiosHLE();
 
-  save: SaveDevice = createSave("none", 0);
+  save: SaveDevice = createSave("none");
   romInfo: RomInfo | null = null;
+  patches: Patch[] = [];
 
-  cycles = 0;
-  frameDone = false;
-  /** Emulation speed multiplier (1 = normal). */
-  speed = 1;
+  private romId = 0;
+  private frameDone = false;
+  /** Cycle count the timers/PPU/APU have been advanced to. */
+  private syncedTo = 0;
+  private syncing = false;
 
   constructor() {
-    this.cpu.bus = this.bus;
-    this.sys.bus = this.bus;
-    this.sys.cpu = this.cpu;
-    this.sys.apu = this.apu;
-    this.ppu.vram = this.bus.vram;
-    this.ppu.pal = this.bus.pal;
-    this.ppu.oam = this.bus.oam;
-    this.biosHle.cpu = this.cpu;
-    this.biosHle.bus = this.bus;
-    this.biosHle.sys = this.sys;
+    const { bus, cpu, ppu, apu, sys } = this;
+    cpu.bus = bus;
+    cpu.swiHandler = (n) => this.biosHle.swi(n);
+    sys.bus = bus; sys.cpu = cpu; sys.apu = apu;
+    bus.ppu = ppu; bus.apu = apu; bus.sys = sys; bus.gpio = this.gpio; bus.save = this.save;
+    bus.ioSync = () => this.sync();
+    ppu.vram = bus.vram; ppu.pal16 = bus.pal16; ppu.oam16 = bus.oam16;
+    this.biosHle.cpu = cpu; this.biosHle.bus = bus; this.biosHle.sys = sys;
 
-    this.bus.devices = [this.sys, this.ppu, this.apu];
-    this.bus.addCycles = (n) => { this.cycles += n; };
-
-    this.cpu.irqLine = () => this.sys.irqLine();
-    this.cpu.haltWake = () => this.sys.haltWake();
-    this.cpu.swiHandler = (n) => this.biosHle.swi(n);
-
-    this.ppu.requestIrq = (bit) => this.sys.requestIrq(bit);
-    this.sys.onIrqFired = () => this.biosHle.checkIntrWait();
-    this.bus.onIntrFlagsWritten = () => this.biosHle.checkIntrWait();
-    this.ppu.onVBlank = () => {
-      this.sys.dmaTrigger(1);
-      this.frameDone = true;
-    };
-    this.ppu.onHBlank = () => this.sys.dmaTrigger(2);
-    this.apu.fifoARequest = () => this.sys.dmaTrigger(3, 0);
-    this.apu.fifoBRequest = () => this.sys.dmaTrigger(3, 1);
-
-    this.bus.sramRead = (a) => this.save.read8(a);
-    this.bus.sramWrite = (a, v) => this.save.write8(a, v);
-    this.bus.eepromRead = () => this.save.eepromRead();
-    this.bus.eepromWrite = (v) => this.save.eepromWrite(v);
-    this.bus.eepromAt = (a) => this.save.eepromAt(a);
+    ppu.requestIrq = (bit) => sys.requestIrq(bit);
+    ppu.onVBlank = () => { sys.dmaTrigger(DmaTiming.VBlank); this.frameDone = true; };
+    ppu.onHBlank = () => sys.dmaTrigger(DmaTiming.HBlank);
+    apu.onFifoRequest = (fifo) => sys.dmaTrigger(DmaTiming.Special, fifo);
+    this.setBios(null);
   }
 
   // ------------------------------------------------------------------
   // Loading
   // ------------------------------------------------------------------
 
-  loadRom(data: Uint8Array, bios?: Uint8Array | null): RomInfo {
+  loadRom(data: Uint8Array): RomInfo {
     this.bus.loadRom(data);
-    this.save = createSave(detectSaveKind(data), data.length);
+    this.save = this.bus.save = createSave(detectSaveKind(data));
+    this.romId = (fnv1a(data.subarray(0, Math.min(data.length, 0x10000))) ^ data.length) >>> 0;
     this.romInfo = {
-      title: ascii(data, 0xa0, 12).replace(/\0.*$/, "").trim(),
+      title: ascii(data, 0xa0, 12),
       code: ascii(data, 0xac, 4),
       maker: ascii(data, 0xb0, 2),
       saveKind: this.save.kind,
     };
-    if (bios && bios.length >= 0x4000) {
-      this.bus.bios = bios.subarray(0, 0x4000).slice();
-      this.cpu.biosPresent = true;
-    } else {
-      this.bus.bios = buildSyntheticBios();
-      this.cpu.biosPresent = false;
-    }
-    this.powerOn();
+    this.patches = [];
+    this.reset();
     return this.romInfo;
   }
 
-  /** Install/remove a real BIOS image at runtime. */
-  setBios(bios: Uint8Array | null): void {
-    if (bios && bios.length >= 0x4000) {
-      this.bus.bios = bios.subarray(0, 0x4000).slice();
-      this.cpu.biosPresent = true;
-    } else {
-      this.bus.bios = buildSyntheticBios();
-      this.cpu.biosPresent = false;
-    }
+  /** Install a real BIOS image, or null for the built-in HLE one. Takes
+   *  effect from the next reset. */
+  setBios(image: Uint8Array | null): void {
+    const real = image !== null && image.length >= BIOS_SIZE;
+    this.bus.setBios(real ? image : buildSyntheticBios());
+    this.cpu.biosPresent = real;
   }
 
-  powerOn(): void {
-    this.bus.ewram.fill(0);
-    this.bus.iwram.fill(0);
-    this.bus.pal.fill(0);
-    this.bus.vram.fill(0);
-    this.bus.oam.fill(0);
-    this.bus.ioFallback.fill(0);
+  /** Power-cycle: everything but the cartridge's save memory. */
+  reset(): void {
+    this.bus.reset();
     this.ppu.reset();
     this.apu.reset();
+    this.sys.reset();
+    this.gpio.reset();
     this.biosHle.reset();
-
-    // Reset system IO state.
-    this.sys.ie = 0; this.sys.if_ = 0; this.sys.ime = 0;
-    this.sys.tmReload.fill(0); this.sys.tmCounter.fill(0); this.sys.tmCnt.fill(0);
-    this.sys.dmaSad.fill(0); this.sys.dmaDad.fill(0);
-    this.sys.dmaCntL.fill(0); this.sys.dmaCntH.fill(0);
-    this.sys.keyinput = 0x3ff;
-    this.sys.keycnt = 0;
-    this.sys.waitcnt = 0;
-    this.sys.postflg = 0;
-
-    this.cycles = 0;
+    this.syncedTo = 0;
     this.frameDone = false;
-
-    // Skip the boot animation: post-BIOS state.
-    this.cpu.reset(0x08000000, false);
-    this.biosHle.applyPostBootState();
-    this.ppu.dispcnt = 0x0080; // forced blank, as the real BIOS leaves it
-    // The real BIOS leaves the affine matrices at identity.
-    this.ppu.bgpa[0] = 0x100; this.ppu.bgpd[0] = 0x100;
-    this.ppu.bgpa[1] = 0x100; this.ppu.bgpd[1] = 0x100;
+    // Start where the BIOS would hand over, skipping the boot animation.
+    this.cpu.bootState(0x08000000);
   }
 
   // ------------------------------------------------------------------
   // Frame loop
   // ------------------------------------------------------------------
 
-  /** Emulate one frame (228 scanlines). Returns when a frame completed. */
-  runFrame(): void {
-    this.frameDone = false;
-    let guard = CYCLES_PER_FRAME * 2;
-    while (!this.frameDone && guard > 0) {
-      const before = this.cycles;
-      this.cpu.step();
-      const elapsed = this.cycles - before;
+  /** Advance timers, video and audio to the CPU's current cycle. */
+  private sync(): void {
+    // DMA started by a device event lands back here through its IO writes.
+    if (this.syncing) return;
+    this.syncing = true;
+    const elapsed = this.bus.cycles - this.syncedTo;
+    this.syncedTo = this.bus.cycles;
+    if (elapsed > 0) {
       this.sys.advance(elapsed);
       this.ppu.advance(elapsed);
       this.apu.advance(elapsed);
-      guard -= elapsed;
     }
-    this.cycles -= CYCLES_PER_FRAME;
-    if (this.cycles < 0) this.cycles = 0;
+    this.syncing = false;
   }
 
-  // ------------------------------------------------------------------
-  // Input
-  // ------------------------------------------------------------------
-
-  setKeys(mask: number): void {
-    const next = (~mask) & 0x3ff;
-    if (next !== this.sys.keyinput) {
-      this.sys.keyinput = next;
-      this.sys.keyChanged();
+  /** Emulate until the next VBlank. */
+  runFrame(): void {
+    const { bus, cpu, sys, ppu } = this;
+    this.frameDone = false;
+    while (!this.frameDone) {
+      // Devices only change state on their own at known points, so the CPU
+      // can run undisturbed up to the nearest one.
+      const target = this.syncedTo + Math.min(ppu.cyclesUntilEvent(), sys.cyclesUntilEvent());
+      if (cpu.halted) bus.cycles = Math.max(bus.cycles, target);
+      else while (bus.cycles < target && !cpu.halted) cpu.step();
+      this.sync();
     }
+    if (bus.cycles > 0x40000000) {
+      bus.cycles -= 0x40000000;
+      this.syncedTo -= 0x40000000;
+    }
+    for (const p of this.patches) this.applyPatch(p);
+  }
+
+  /** Execute a single instruction (or, when halted, skip to the next
+   *  device event). For tracing and debugging tools. */
+  step(): void {
+    const { bus, cpu } = this;
+    if (cpu.halted) bus.cycles = this.syncedTo + Math.min(this.ppu.cyclesUntilEvent(), this.sys.cyclesUntilEvent());
+    else cpu.step();
+    this.sync();
+  }
+
+  private applyPatch(p: Patch): void {
+    if (p.size === 1) this.bus.poke8(p.addr, p.value);
+    else if (p.size === 2) this.bus.poke16(p.addr, p.value);
+    else this.bus.poke32(p.addr, p.value);
+  }
+
+  /** `pressed`: bit set = button down, in KEYINPUT bit order. */
+  setKeys(pressed: number): void {
+    this.sys.setKeys(pressed);
   }
 
   // ------------------------------------------------------------------
-  // Save states (binary snapshot)
+  // Save states
   // ------------------------------------------------------------------
 
-  serializeState(): ArrayBuffer {
-    const parts: ArrayBuffer[] = [];
-    const push = (a: ArrayBufferView | ArrayBuffer) => {
-      parts.push(a instanceof ArrayBuffer ? a : a.buffer.slice(a.byteOffset, a.byteOffset + a.byteLength) as ArrayBuffer);
-    };
-    // Header: magic + rom checksum-ish id
-    const header = new Uint32Array([0x47424153, this.bus.rom.length, 1]);
-    push(header);
-    push(this.cpu.r);
-    push(new Int32Array([this.cpu.cpsr, this.cpu.pc, this.cpu.halted ? 1 : 0]));
-    push(this.bus.ewram);
-    push(this.bus.iwram);
-    push(this.bus.pal);
-    push(this.bus.vram);
-    push(this.bus.oam);
-    push(this.bus.ioFallback);
-    push(new Int32Array([
-      this.ppu.dispcnt, this.ppu.dispstat, this.ppu.vcount,
-      this.sys.ie, this.sys.if_, this.sys.ime,
-      this.sys.keyinput, this.sys.keycnt, this.sys.waitcnt,
-    ]));
-    push(this.ppu.bgcnt);
-    push(this.ppu.bghofs);
-    push(this.ppu.bgvofs);
-    push(this.ppu.bgpa); push(this.ppu.bgpb); push(this.ppu.bgpc); push(this.ppu.bgpd);
-    push(this.ppu.bgx); push(this.ppu.bgy);
-    push(new Int32Array([this.ppu.win0h, this.ppu.win1h, this.ppu.win0v, this.ppu.win1v,
-      this.ppu.winin, this.ppu.winout, this.ppu.mosaic,
-      this.ppu.bldcnt, this.ppu.bldalpha, this.ppu.bldy]));
-    push(this.sys.tmReload); push(this.sys.tmCounter); push(this.sys.tmCnt);
-    push(this.sys.dmaSad); push(this.sys.dmaDad); push(this.sys.dmaCntL); push(this.sys.dmaCntH);
-    push(new Uint8Array(this.save.data));
-
-    let total = 0;
-    for (const p of parts) total += p.byteLength;
-    const out = new Uint8Array(total);
-    let off = 0;
-    for (const p of parts) { out.set(new Uint8Array(p), off); off += p.byteLength; }
-    return out.buffer as ArrayBuffer;
+  serializeState(): Uint8Array {
+    this.sync();
+    const w = new StateWriter();
+    w.u32(STATE_MAGIC); w.u32(STATE_VERSION); w.u32(this.romId);
+    this.bus.saveState(w);
+    this.cpu.saveState(w);
+    this.sys.saveState(w);
+    this.ppu.saveState(w);
+    this.apu.saveState(w);
+    this.gpio.saveState(w);
+    this.biosHle.saveState(w);
+    this.save.saveState(w);
+    return w.finish();
   }
 
-  deserializeState(buf: ArrayBuffer): boolean {
-    const bytes = new Uint8Array(buf);
-    const view = new DataView(buf);
-    if (bytes.length < 12 || view.getUint32(0, true) !== 0x47424153) return false;
-    let off = 12;
-    const take = (n: number) => { const s = bytes.slice(off, off + n); off += n; return s; };
-    this.cpu.r.set(new Int32Array(take(64).buffer.slice(0) as ArrayBuffer));
-    const c = new Int32Array(take(12).buffer.slice(0) as ArrayBuffer);
-    this.cpu.cpsr = c[0];
-    this.bus.ewram.set(take(256 * 1024));
-    this.bus.iwram.set(take(32 * 1024));
-    this.bus.pal.set(take(1024));
-    this.bus.vram.set(take(96 * 1024));
-    this.bus.oam.set(take(1024));
-    this.bus.ioFallback.set(take(0x800));
-    const io = new Int32Array(take(40).buffer.slice(0) as ArrayBuffer);
-    this.ppu.dispcnt = io[0]; this.ppu.dispstat = io[1]; this.ppu.vcount = io[2];
-    this.sys.ie = io[3]; this.sys.if_ = io[4]; this.sys.ime = io[5];
-    this.sys.keyinput = io[6]; this.sys.keycnt = io[7]; this.sys.waitcnt = io[8];
-    this.ppu.bgcnt.set(new Uint16Array(take(8).buffer.slice(0) as ArrayBuffer));
-    this.ppu.bghofs.set(new Uint16Array(take(8).buffer.slice(0) as ArrayBuffer));
-    this.ppu.bgvofs.set(new Uint16Array(take(8).buffer.slice(0) as ArrayBuffer));
-    this.ppu.bgpa.set(new Int16Array(take(4).buffer.slice(0) as ArrayBuffer));
-    this.ppu.bgpb.set(new Int16Array(take(4).buffer.slice(0) as ArrayBuffer));
-    this.ppu.bgpc.set(new Int16Array(take(4).buffer.slice(0) as ArrayBuffer));
-    this.ppu.bgpd.set(new Int16Array(take(4).buffer.slice(0) as ArrayBuffer));
-    this.ppu.bgx.set(new Int32Array(take(8).buffer.slice(0) as ArrayBuffer));
-    this.ppu.bgy.set(new Int32Array(take(8).buffer.slice(0) as ArrayBuffer));
-    const misc = new Int32Array(take(40).buffer.slice(0) as ArrayBuffer);
-    [this.ppu.win0h, this.ppu.win1h, this.ppu.win0v, this.ppu.win1v,
-      this.ppu.winin, this.ppu.winout, this.ppu.mosaic,
-      this.ppu.bldcnt, this.ppu.bldalpha, this.ppu.bldy] = misc;
-    this.sys.tmReload.set(new Uint16Array(take(8).buffer.slice(0) as ArrayBuffer));
-    this.sys.tmCounter.set(new Uint16Array(take(8).buffer.slice(0) as ArrayBuffer));
-    this.sys.tmCnt.set(new Uint16Array(take(8).buffer.slice(0) as ArrayBuffer));
-    this.sys.dmaSad.set(new Uint32Array(take(16).buffer.slice(0) as ArrayBuffer));
-    this.sys.dmaDad.set(new Uint32Array(take(16).buffer.slice(0) as ArrayBuffer));
-    this.sys.dmaCntL.set(new Uint16Array(take(8).buffer.slice(0) as ArrayBuffer));
-    this.sys.dmaCntH.set(new Uint16Array(take(8).buffer.slice(0) as ArrayBuffer));
-    this.save.data.set(take(this.save.size));
-    // Restore pipeline: pc is pushed through cpu.pc already? We stored pc
-    // but the pipeline needs a flush. Set pc then flush.
-    this.cpu.pc = c[1];
-    this.cpu.halted = c[2] !== 0;
-    this.cpu.thumbMode = (this.cpu.cpsr & 0x20) !== 0;
-    this.cpu.flush();
+  /** Returns false (leaving the machine untouched) if the state belongs to
+   *  another ROM or an older format. */
+  deserializeState(data: Uint8Array): boolean {
+    const r = new StateReader(data);
+    try {
+      if (r.u32() !== STATE_MAGIC || r.u32() !== STATE_VERSION || r.u32() !== this.romId) return false;
+    } catch {
+      return false;
+    }
+    this.bus.loadState(r);
+    this.cpu.loadState(r);
+    this.sys.loadState(r);
+    this.ppu.loadState(r);
+    this.apu.loadState(r);
+    this.gpio.loadState(r);
+    this.biosHle.loadState(r);
+    this.save.loadState(r);
+    this.syncedTo = this.bus.cycles;
+    this.frameDone = false;
     return true;
   }
 }
@@ -270,7 +215,14 @@ function ascii(data: Uint8Array, off: number, len: number): string {
   let s = "";
   for (let i = 0; i < len; i++) {
     const c = data[off + i];
-    s += c >= 32 && c < 127 ? String.fromCharCode(c) : "";
+    if (c === 0) break;
+    if (c >= 32 && c < 127) s += String.fromCharCode(c);
   }
-  return s;
+  return s.trim();
+}
+
+function fnv1a(data: Uint8Array): number {
+  let h = 0x811c9dc5;
+  for (let i = 0; i < data.length; i++) h = Math.imul(h ^ data[i], 0x01000193);
+  return h >>> 0;
 }

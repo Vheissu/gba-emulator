@@ -52,12 +52,7 @@ while (count < max) {
     console.log(history.join("\n"));
     break;
   }
-  const before = gba.cycles;
-  gba.cpu.step();
-  const elapsed = gba.cycles - before;
-  gba.sys.advance(elapsed);
-  gba.ppu.advance(elapsed);
-  gba.apu.advance(elapsed);
+  gba.step();
   count++;
 }
 if (count >= max) console.log(`completed ${max} instructions, pc ok: ${gba.cpu.pc.toString(16)}`);

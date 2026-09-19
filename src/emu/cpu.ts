@@ -4,7 +4,8 @@
 // pc = execAddr + 8 (ARM) or +4 (Thumb). The pipeline holds the two
 // instructions ahead of the one executing.
 
-import { Bus } from "./bus";
+import type { Bus } from "./bus";
+import type { StateReader, StateWriter } from "./state";
 
 export const MODE_USR = 0x10;
 export const MODE_FIQ = 0x11;
@@ -24,15 +25,29 @@ const T = 0x20;
 
 type Handler = (instr: number) => void;
 
+const BANKED_MODES = [MODE_USR, MODE_FIQ, MODE_IRQ, MODE_SVC, MODE_ABT, MODE_UND];
+
+// Condition codes as a truth table over the NZCV nibble: bit f of
+// COND_TABLE[cond] is set when `cond` passes with flags f.
+const COND_TABLE = new Uint16Array(16);
+for (let flags = 0; flags < 16; flags++) {
+  const n = (flags & 8) !== 0, z = (flags & 4) !== 0, c = (flags & 2) !== 0, v = (flags & 1) !== 0;
+  const pass = [
+    z, !z, c, !c, n, !n, v, !v,
+    c && !z, !c || z, n === v, n !== v, !z && n === v, z || n !== v, true, false,
+  ];
+  pass.forEach((p, cond) => { if (p) COND_TABLE[cond] |= 1 << flags; });
+}
+
 export class CPU {
   bus!: Bus;
 
   /** HLE SWI dispatch; only used when no BIOS image is loaded. */
   swiHandler: (num: number) => void = () => {};
-  irqLine: () => boolean = () => false;
-  /** Halt wake condition: IE & IF (IME does not gate waking). */
-  haltWake: () => boolean = () => false;
+  /** Level of the interrupt controller's output (IME && IE & IF). */
+  irqLine = false;
   biosPresent = false;
+  /** Set by HALTCNT / Halt SWIs; cleared by the interrupt controller. */
   halted = false;
 
   r = new Int32Array(16);
@@ -43,13 +58,14 @@ export class CPU {
   private pipe0 = 0;
   private pipe1 = 0;
   private flushed = false;
+  /** Carry out of the most recent barrel-shifter operation. */
+  private shiftCarry = false;
 
   // Banked storage for modes that are not currently active.
   private fiqLo = new Int32Array(5);
   private otherLo = new Int32Array(5);
   private bankHi: Record<number, Int32Array> = {
     [MODE_USR]: new Int32Array(2),
-    [MODE_SYS]: new Int32Array(2),
     [MODE_FIQ]: new Int32Array(2),
     [MODE_SVC]: new Int32Array(2),
     [MODE_ABT]: new Int32Array(2),
@@ -64,6 +80,7 @@ export class CPU {
   private thumbTable: Handler[] = [];
 
   constructor() {
+    this.bankHi[MODE_SYS] = this.bankHi[MODE_USR]; // System mode uses the User bank
     this.buildArmTable();
     this.buildThumbTable();
   }
@@ -78,11 +95,6 @@ export class CPU {
   get v(): boolean { return (this.cpsr & V) !== 0; }
   get mode(): number { return this.cpsr & 0x1f; }
   get isThumb(): boolean { return this.thumb; }
-  get thumbMode(): boolean { return this.thumb; }
-  set thumbMode(v: boolean) {
-    this.thumb = v;
-    this.cpsr = v ? this.cpsr | T : this.cpsr & ~T;
-  }
 
   setNZ(result: number): void {
     this.cpsr = (this.cpsr & ~(N | Z)) | (result < 0 ? N : 0) | ((result | 0) === 0 ? Z : 0);
@@ -214,27 +226,27 @@ export class CPU {
     this.flush();
   }
 
-  reset(startAddr: number, thumb = false): void {
-    this.cpsr = MODE_SYS | I | F;
-    this.thumb = thumb;
-    if (thumb) this.cpsr |= T;
-    for (let i = 0; i < 16; i++) this.r[i] = 0;
-    this.flushed = false;
+  /** State the BIOS hands over to a cartridge: System mode, interrupts on,
+   *  per-mode stacks at the top of IWRAM. */
+  bootState(entry: number): void {
+    this.r.fill(0);
+    this.fiqLo.fill(0); this.otherLo.fill(0);
+    for (const m of BANKED_MODES) { this.bankHi[m].fill(0); this.spsrBank[m] = 0; }
+    this.bankHi[MODE_IRQ][0] = 0x03007fa0;
+    this.bankHi[MODE_SVC][0] = 0x03007fe0;
+    this.cpsr = MODE_SYS;
+    this.thumb = false;
     this.halted = false;
-    this.pc = startAddr | 0;
-    this.flush();
-    this.flushed = false;
+    this.r[13] = 0x03007f00;
+    this.writePC(entry);
   }
 
+  /** Execute one instruction. The caller skips this while `halted`. */
   step(): void {
-    if (this.halted) {
-      this.bus.internal(1);
-      if (this.haltWake()) this.halted = false;
-      else return;
-    }
-    if (!(this.cpsr & I) && this.irqLine()) {
+    if (this.irqLine && !(this.cpsr & I)) {
       this.exception(0x18, MODE_IRQ);
     }
+    this.flushed = false;
     if (this.thumb) {
       const instr = this.pipe0;
       this.pipe0 = this.pipe1;
@@ -245,17 +257,52 @@ export class CPU {
       const instr = this.pipe0;
       this.pipe0 = this.pipe1;
       this.pipe1 = this.bus.fetch32(this.pc);
-      const idx = ((instr >>> 16) & 0xff0) | ((instr >>> 4) & 0xf);
-      this.armTable[idx](instr);
+      if ((COND_TABLE[instr >>> 28] >>> (this.cpsr >>> 28)) & 1) {
+        this.armTable[((instr >>> 16) & 0xff0) | ((instr >>> 4) & 0xf)].call(this, instr);
+      }
       if (!this.flushed) this.pc = (this.pc + 4) | 0;
     }
-    this.flushed = false;
   }
 
-  private exception(vector: number, mode: number): void {
-    // LR = (address of next instruction) + 4.
-    // At the instruction boundary pc = nextExec + 8 (ARM) or +4 (Thumb).
-    const lr = this.thumb ? this.pc : (this.pc - 4) | 0;
+  /** Re-run the instruction currently executing once it is next reached;
+   *  used by HLE SWIs that block (IntrWait). */
+  restartInstruction(): void {
+    this.writePC((this.pc - (this.thumb ? 4 : 8)) | 0);
+  }
+
+  /** Enter an exception. `lr` defaults to the IRQ convention: the address
+   *  of the next instruction + 4, where at an instruction boundary
+   *  pc = nextExec + 8 (ARM) or + 4 (Thumb). */
+  saveState(w: StateWriter): void {
+    w.array(this.r);
+    w.u32(this.cpsr); w.u32(this.pc); w.bool(this.halted);
+    w.array(this.fiqLo); w.array(this.otherLo);
+    for (const m of BANKED_MODES) {
+      w.array(this.bankHi[m]);
+      w.u32(this.spsrBank[m] ?? 0);
+    }
+  }
+
+  loadState(r: StateReader): void {
+    r.arrayInto(this.r);
+    this.cpsr = r.u32() | 0;
+    const pc = r.u32();
+    this.halted = r.bool();
+    r.arrayInto(this.fiqLo); r.arrayInto(this.otherLo);
+    for (const m of BANKED_MODES) {
+      r.arrayInto(this.bankHi[m]);
+      const spsr = r.u32();
+      if (m !== MODE_USR) this.spsrBank[m] = spsr;
+    }
+    // `pc` was saved two instructions ahead; refill the pipeline behind it.
+    this.thumb = (this.cpsr & T) !== 0;
+    this.pc = (pc - (this.thumb ? 4 : 8)) | 0;
+    const cycles = this.bus.cycles;
+    this.flush();
+    this.bus.cycles = cycles;
+  }
+
+  private exception(vector: number, mode: number, lr = this.thumb ? this.pc : (this.pc - 4) | 0): void {
     const saved = this.cpsr;
     this.switchMode(mode);
     this.spsrBank[mode] = saved;
@@ -269,17 +316,8 @@ export class CPU {
 
   private swi(num: number): void {
     if (this.biosPresent) {
-      // Vector into the real BIOS.
-      const lr = this.thumb ? this.pc : (this.pc - 4) | 0;
-      const saved = this.cpsr;
-      this.switchMode(MODE_SVC);
-      this.spsrBank[MODE_SVC] = saved;
-      this.r[14] = lr;
-      this.thumb = false;
-      this.cpsr = (this.cpsr & ~(T | 0x1f)) | MODE_SVC | I;
-      this.pc = 0x08;
-      this.flush();
-      this.bus.internal(1);
+      // Vector into the real BIOS; LR is the instruction after the SWI.
+      this.exception(0x08, MODE_SVC, (this.pc - (this.thumb ? 2 : 4)) | 0);
     } else {
       // HLE: perform the SWI inline and continue at the next instruction.
       this.swiHandler(num);
@@ -290,16 +328,18 @@ export class CPU {
   // Shared shifter
   // ------------------------------------------------------------------
 
-  private shifterImm(instr: number): [number, boolean] {
+  /** Rotated 8-bit immediate operand; carry-out lands in `shiftCarry`. */
+  private shifterImm(instr: number): number {
     const imm = instr & 0xff;
     const rot = ((instr >>> 8) & 0xf) * 2;
-    if (rot === 0) return [imm, this.c];
+    if (rot === 0) { this.shiftCarry = this.c; return imm; }
     const v = ((imm >>> rot) | (imm << (32 - rot))) | 0;
-    return [v, (v & 0x80000000) !== 0];
+    this.shiftCarry = v < 0;
+    return v;
   }
 
-  /** Shifter for register operand2; rm already resolved. */
-  private shiftValue(rm: number, type: number, amount: number, byReg: boolean): [number, boolean] {
+  /** Barrel shifter for a register operand; carry-out lands in `shiftCarry`. */
+  private shiftValue(rm: number, type: number, amount: number, byReg: boolean): number {
     let sc = this.c;
     let op2 = rm;
     switch (type) {
@@ -334,7 +374,15 @@ export class CPU {
         }
         break;
     }
-    return [op2 | 0, sc];
+    this.shiftCarry = sc;
+    return op2 | 0;
+  }
+
+  /** LDR of a misaligned address reads the aligned word, rotated. */
+  private loadWord(addr: number): number {
+    const raw = this.bus.read32(addr);
+    const rot = (addr & 3) * 8;
+    return rot ? (raw >>> rot) | (raw << (32 - rot)) : raw | 0;
   }
 
   private regRead(i: number): number {
@@ -346,24 +394,7 @@ export class CPU {
   // ------------------------------------------------------------------
 
   private condPass(cond: number): boolean {
-    switch (cond & 0xf) {
-      case 0x0: return this.z;
-      case 0x1: return !this.z;
-      case 0x2: return this.c;
-      case 0x3: return !this.c;
-      case 0x4: return this.n;
-      case 0x5: return !this.n;
-      case 0x6: return this.v;
-      case 0x7: return !this.v;
-      case 0x8: return this.c && !this.z;
-      case 0x9: return !this.c || this.z;
-      case 0xa: return this.n === this.v;
-      case 0xb: return this.n !== this.v;
-      case 0xc: return !this.z && this.n === this.v;
-      case 0xd: return this.z || this.n !== this.v;
-      case 0xe: return true;
-      default: return false;
-    }
+    return ((COND_TABLE[cond] >>> (this.cpsr >>> 28)) & 1) !== 0;
   }
 
   private armDataProc(instr: number): void {
@@ -377,18 +408,19 @@ export class CPU {
     const pcExtra = byReg ? 4 : 0;
     const a = rn === 15 ? (this.pc + pcExtra) | 0 : this.r[rn] | 0;
 
-    let op2: number, sc: boolean;
+    let op2: number;
     if (instr & 0x02000000) {
-      [op2, sc] = this.shifterImm(instr);
+      op2 = this.shifterImm(instr);
     } else {
       const rm = (instr & 0xf) === 15 ? (this.pc + pcExtra) | 0 : this.r[instr & 0xf] | 0;
       const amount = byReg
         ? this.regRead((instr >>> 8) & 0xf) & 0xff
         : (instr >>> 7) & 0x1f;
       if (byReg) this.bus.internal(1);
-      if (byReg && amount === 0) { op2 = rm; sc = this.c; }
-      else [op2, sc] = this.shiftValue(rm, (instr >>> 5) & 3, amount, byReg);
+      if (byReg && amount === 0) { op2 = rm; this.shiftCarry = this.c; }
+      else op2 = this.shiftValue(rm, (instr >>> 5) & 3, amount, byReg);
     }
+    const sc = this.shiftCarry;
 
     let res: number;
     switch (opcode) {
@@ -438,7 +470,7 @@ export class CPU {
   }
 
   private armSWI(instr: number): void {
-    this.swi(instr & 0x00ffffff);
+    this.swi((instr >>> 16) & 0xff);
   }
 
   private mulCycles(rs: number): number {
@@ -471,16 +503,21 @@ export class CPU {
     const rs = (instr >>> 8) & 0xf;
     const a = this.r[instr & 0xf] | 0;
     const b = this.r[rs] | 0;
-    const prod = signed
-      ? BigInt(a) * BigInt(b)
-      : BigInt(a >>> 0) * BigInt(b >>> 0);
-    let lo = Number(prod & 0xffffffffn) | 0;
-    let hi = Number((prod >> 32n) & 0xffffffffn) | 0;
+    // 32x32 -> 64 via 16-bit limbs; signedness is a correction to the
+    // high word.
+    const aL = a & 0xffff, aH = a >>> 16, bL = b & 0xffff, bH = b >>> 16;
+    const mid = aH * bL + ((aL * bL) >>> 16);
+    const mid2 = aL * bH + (mid & 0xffff);
+    let lo = Math.imul(a, b);
+    let hi = (aH * bH + Math.floor(mid / 0x10000) + Math.floor(mid2 / 0x10000)) | 0;
+    if (signed) {
+      if (a < 0) hi = (hi - b) | 0;
+      if (b < 0) hi = (hi - a) | 0;
+    }
     if (acc) {
-      const sum = BigInt(lo >>> 0) + BigInt(this.r[rdLo] >>> 0);
-      const carryOut = Number((sum >> 32n) & 1n);
-      lo = Number(sum & 0xffffffffn) | 0;
-      hi = (hi + this.r[rdHi] + carryOut) | 0;
+      const sum = (lo >>> 0) + (this.r[rdLo] >>> 0);
+      lo = sum | 0;
+      hi = (hi + this.r[rdHi] + (sum > 0xffffffff ? 1 : 0)) | 0;
     }
     this.r[rdLo] = lo;
     this.r[rdHi] = hi;
@@ -509,9 +546,16 @@ export class CPU {
 
     if (load) {
       let v = 0;
-      if (sh === 1) v = this.bus.read16(addr) & 0xffff;
-      else if (sh === 2) v = (this.bus.read8(addr) << 24) >> 24;
-      else v = (this.bus.read16(addr) << 16) >> 16;
+      if (sh === 1) {
+        // A misaligned LDRH reads the aligned halfword rotated by 8.
+        v = this.bus.read16(addr);
+        if (addr & 1) v = ((v >>> 8) | (v << 24)) >>> 0;
+      } else if (sh === 2 || addr & 1) {
+        // ...and a misaligned LDRSH degrades to LDRSB.
+        v = (this.bus.read8(addr) << 24) >> 24;
+      } else {
+        v = (this.bus.read16(addr) << 16) >> 16;
+      }
       if (rd === 15) this.writePC(v >>> 0);
       else this.r[rd] = v | 0;
       this.bus.internal(1);
@@ -540,8 +584,7 @@ export class CPU {
     if (regOff) {
       const rm = this.regRead(instr & 0xf);
       const amount = (instr >>> 7) & 0x1f;
-      [offset] = this.shiftValue(rm, (instr >>> 5) & 3, amount, false);
-      offset >>>= 0;
+      offset = this.shiftValue(rm, (instr >>> 5) & 3, amount, false) >>> 0;
     } else {
       offset = instr & 0xfff;
     }
@@ -555,9 +598,7 @@ export class CPU {
       if (byte) {
         v = this.bus.read8(addr);
       } else {
-        const raw = this.bus.read32(addr & ~3);
-        const rot = (addr & 3) * 8;
-        v = rot ? ((raw >>> rot) | (raw << (32 - rot))) >>> 0 : raw;
+        v = this.loadWord(addr);
       }
       if (rd === 15) this.writePC(v >>> 0);
       else this.r[rd] = v | 0;
@@ -579,20 +620,17 @@ export class CPU {
     const load = (instr & 0x00100000) !== 0;
     const rn = (instr >>> 16) & 0xf;
     let list = instr & 0xffff;
-    const hasR15 = (list & 0x8000) !== 0;
-
-    let count = 0;
-    for (let i = 0; i < 16; i++) if (list & (1 << i)) count++;
-    if (count === 0) { list = 0x8000; count = 1; }
+    // An empty list transfers r15 alone but moves the base by 0x40.
+    let size = count8(list & 0xff) * 4 + count8(list >>> 8) * 4;
+    if (list === 0) { list = 0x8000; size = 0x40; }
 
     const base = this.regRead(rn) >>> 0;
-    const size = count * 4;
     const newBase = up ? (base + size) >>> 0 : (base - size) >>> 0;
     let addr = up
       ? (pre ? (base + 4) >>> 0 : base)
       : (pre ? (base - size) >>> 0 : (base - size + 4) >>> 0);
 
-    const useUser = s && !(load && hasR15);
+    const useUser = s && !(load && (list & 0x8000) !== 0);
 
     if (load) {
       let branchTo: number | null = null;
@@ -643,11 +681,9 @@ export class CPU {
       this.bus.write8(addr, src & 0xff);
       this.r[rd] = v;
     } else {
-      const raw = this.bus.read32(addr & ~3);
-      const rot = (addr & 3) * 8;
-      const v = rot ? ((raw >>> rot) | (raw << (32 - rot))) >>> 0 : raw;
+      const v = this.loadWord(addr);
       this.bus.write32(addr, src >>> 0);
-      this.r[rd] = v | 0;
+      this.r[rd] = v;
     }
     this.bus.internal(1);
   }
@@ -661,10 +697,14 @@ export class CPU {
     const toSPSR = (instr & 0x00400000) !== 0;
     const mask = (instr >>> 16) & 0xf;
     let value: number;
-    if (instr & 0x02000000) [value] = this.shifterImm(instr);
+    if (instr & 0x02000000) value = this.shifterImm(instr);
     else value = this.r[instr & 0xf] | 0;
     if (toSPSR) this.setSPSR(value, mask);
     else this.writeCPSR(value, mask);
+  }
+
+  private armUndefined(_instr: number): void {
+    this.exception(0x04, MODE_UND, (this.pc - (this.thumb ? 2 : 4)) | 0);
   }
 
   private armBX(instr: number): void {
@@ -688,22 +728,19 @@ export class CPU {
     const low = i & 0xf;    // instr[7:4]
     const b2725 = op >> 5;  // instr[27:25]
 
-    const run = (fn: Handler): Handler => {
-      const bound = fn.bind(this);
-      return (instr: number) => {
-        if (this.condPass(instr >>> 28)) bound(instr);
-      };
-    };
+    // Handlers are invoked with .call(this); the condition check lives in step().
+    const run = (fn: Handler): Handler => fn;
+    const undef: Handler = this.armUndefined;
 
     if (b2725 === 0b101) return run(this.armBranch);
     if (b2725 === 0b100) return run(this.armBlockTransfer);
-    if (b2725 === 0b110) return () => {};
+    if (b2725 === 0b110) return undef; // coprocessor transfers: none fitted
     if (b2725 === 0b111) {
       if (op & 0x10) return run(this.armSWI);
-      return () => {};
+      return undef;
     }
     if (b2725 === 0b010 || b2725 === 0b011) {
-      if (b2725 === 0b011 && (low & 1) !== 0) return () => {};
+      if (b2725 === 0b011 && (low & 1) !== 0) return undef;
       return run(this.armSingleTransfer);
     }
 
@@ -907,7 +944,7 @@ export class CPU {
           case 1: return (x) => this.bus.write16(((this.r[(x >>> 3) & 7] + this.r[(x >>> 6) & 7]) >>> 0), this.r[x & 7] & 0xffff);
           case 2: return (x) => this.bus.write8(((this.r[(x >>> 3) & 7] + this.r[(x >>> 6) & 7]) >>> 0), this.r[x & 7] & 0xff);
           case 3: return (x) => { this.r[x & 7] = (this.bus.read8(((this.r[(x >>> 3) & 7] + this.r[(x >>> 6) & 7]) >>> 0)) << 24) >> 24; this.bus.internal(1); };
-          case 4: return (x) => { const a = ((this.r[(x >>> 3) & 7] + this.r[(x >>> 6) & 7]) >>> 0); this.r[x & 7] = this.bus.read32(a & ~3) | 0; this.bus.internal(1); };
+          case 4: return (x) => { this.r[x & 7] = this.loadWord((this.r[(x >>> 3) & 7] + this.r[(x >>> 6) & 7]) >>> 0); this.bus.internal(1); };
           case 5: return (x) => { this.r[x & 7] = this.bus.read16(((this.r[(x >>> 3) & 7] + this.r[(x >>> 6) & 7]) >>> 0)) & 0xffff; this.bus.internal(1); };
           case 6: return (x) => { this.r[x & 7] = this.bus.read8(((this.r[(x >>> 3) & 7] + this.r[(x >>> 6) & 7]) >>> 0)) & 0xff; this.bus.internal(1); };
           default: return (x) => { this.r[x & 7] = (this.bus.read16(((this.r[(x >>> 3) & 7] + this.r[(x >>> 6) & 7]) >>> 0)) << 16) >> 16; this.bus.internal(1); };
@@ -924,7 +961,7 @@ export class CPU {
           if (load) {
             this.r[x & 7] = byte
               ? this.bus.read8(addr)
-              : this.bus.read32(addr & ~3) >>> 0;
+              : this.loadWord(addr);
             this.bus.internal(1);
           } else {
             if (byte) this.bus.write8(addr, this.r[x & 7] & 0xff);
@@ -1013,14 +1050,19 @@ export class CPU {
           const rb = (x >>> 8) & 7;
           const list = x & 0xff;
           let addr = this.r[rb] >>> 0;
-          if (list === 0) { this.r[rb] = (this.r[rb] + 0x40) | 0; return; }
-          const inList = (list & (1 << rb)) !== 0;
+          if (list === 0) {
+            // Empty list: transfers r15 and moves the base by 0x40.
+            if (load) this.writePC(this.bus.read32(addr));
+            else this.bus.write32(addr, (this.pc + 2) >>> 0);
+            this.r[rb] = (this.r[rb] + 0x40) | 0;
+            return;
+          }
           if (load) {
             for (let reg = 0; reg < 8; reg++) {
               if (list & (1 << reg)) { this.r[reg] = this.bus.read32(addr) | 0; addr += 4; }
             }
-            this.r[rb] = addr | 0;
-            void inList;
+            // A loaded base register keeps the loaded value.
+            if (!(list & (1 << rb))) this.r[rb] = addr | 0;
             this.bus.internal(1);
           } else {
             let first = true;
@@ -1040,7 +1082,7 @@ export class CPU {
       case 0xd: {
         const cond = (instr >>> 8) & 0xf;
         if (cond === 0xf) return (x) => this.swi(x & 0xff);
-        if (cond === 0xe) return () => {};
+        if (cond === 0xe) return (x) => this.armUndefined(x);
         return (x) => {
           if (this.condPass(cond)) {
             const off = ((x & 0xff) << 24) >> 24;

@@ -7,15 +7,17 @@
 //    user handler at 0x03007FFC).
 // 2. SWI calls are intercepted in JS (see CPU.swi): no vectoring needed.
 
-import { Bus } from "./bus";
-import { CPU, MODE_SYS, MODE_IRQ, MODE_SVC } from "./cpu";
+import type { Bus } from "./bus";
+import type { CPU } from "./cpu";
 import type { System } from "./system";
+import type { StateReader, StateWriter } from "./state";
+
+/** What a real BIOS leaves on its read latch after a SWI returns. */
+const LATCH_AFTER_SWI = 0xe3a02004;
 
 // ---------------------------------------------------------------------------
 // Synthetic BIOS image
 // ---------------------------------------------------------------------------
-
-function u32(...v: number[]): number[] { return v; }
 
 export function buildSyntheticBios(): Uint8Array {
   const bios = new Uint8Array(0x4000);
@@ -46,7 +48,7 @@ export function buildSyntheticBios(): Uint8Array {
   w(0x34, 0xeafffffe); // b .
 
   // IRQ shim at 0x40.
-  const code = u32(
+  const code = [
     0xe92d500f, // stmfd sp!, {r0-r3, r12, lr}
     0xe59f0034, // ldr r0, [pc, #0x34]   -> 0x04000200
     0xe1d010b2, // ldrh r1, [r0, #2]     IF
@@ -61,7 +63,7 @@ export function buildSyntheticBios(): Uint8Array {
     0xe12fff1c, // bx r12
     0xe8bd500f, // ldmfd sp!, {r0-r3, r12, lr}
     0xe25ef004, // subs pc, lr, #4
-  );
+  ];
   code.forEach((v, i) => w(0x40 + i * 4, v));
 
   // Literal pool: pc during exec = instrAddr + 8.
@@ -69,6 +71,10 @@ export function buildSyntheticBios(): Uint8Array {
   // ldr r2 at 0x54: pc=0x5c -> target 0x5c+0x2c = 0x88.
   w(0x80, 0x04000200);
   w(0x88, 0x03007ff8);
+
+  // The pipeline prefetches two words past the final `subs pc`; games that
+  // probe the BIOS read latch expect the real BIOS's value there.
+  w(0x7c, 0xe55ec002);
 
   return bios;
 }
@@ -82,411 +88,292 @@ export class BiosHLE {
   bus!: Bus;
   sys!: System;
 
-  /** IntrWait bookkeeping. */
-  intrWaitFlags = 0;
-  intrWaitDiscard = 0;
-  intrWaiting = false;
+  /** Flags an in-progress IntrWait is blocked on (0 = not waiting). */
+  private waitFlags = 0;
 
   reset(): void {
-    this.intrWaitFlags = 0;
-    this.intrWaiting = false;
-  }
-
-  private rd16(addr: number): number {
-    return this.bus.peek16(addr) & 0xffff;
-  }
-  private rd32(addr: number): number {
-    return this.bus.peek32(addr) >>> 0;
-  }
-  private wr16(addr: number, v: number): void {
-    this.bus.poke16(addr, v);
-  }
-  private wr32(addr: number, v: number): void {
-    this.bus.poke32(addr, v >>> 0);
+    this.waitFlags = 0;
   }
 
   swi(num: number): void {
     const r = this.cpu.r;
+    this.bus.setBiosLatch(LATCH_AFTER_SWI);
     switch (num) {
       case 0x00: this.softReset(); return;
       case 0x01: this.registerRamReset(r[0]); return;
-      case 0x02: case 0x03: this.cpu.halted = true; return;
-      case 0x04: this.intrWait(r[0] & 1, r[1] & 0x3fff); return;
-      case 0x05: this.intrWait(1, 1); return;
-      case 0x06: { // Div r0/r1
-        const a = r[0] | 0, b = r[1] | 0;
-        if (b === 0) { r[0] = a < 0 ? 1 : -1; r[1] = a; r[3] = 1; return; }
-        const q = (a / b) | 0;
-        r[0] = q; r[1] = (a - q * b) | 0; r[3] = Math.abs(q);
-        return;
-      }
-      case 0x07: { // DivArm: r1/r0
-        const b = r[0] | 0, a = r[1] | 0;
-        if (b === 0) { r[0] = a < 0 ? 1 : -1; r[1] = a; r[3] = 1; return; }
-        const q = (a / b) | 0;
-        r[0] = q; r[1] = (a - q * b) | 0; r[3] = Math.abs(q);
-        return;
-      }
+      case 0x02: case 0x03: this.sys.halt(); return;
+      case 0x04: this.intrWait(r[0] !== 0, r[1] & 0x3fff); return;
+      case 0x05: this.intrWait(true, 1); return;
+      case 0x06: this.div(r[0], r[1]); return;
+      case 0x07: this.div(r[1], r[0]); return;
       case 0x08: r[0] = Math.floor(Math.sqrt(r[0] >>> 0)); return;
-      case 0x09: {
-        const t = r[0] | 0;
-        r[0] = Math.round(Math.atan2(t, 65536) * 0x8000 / Math.PI);
-        return;
-      }
-      case 0x0a: {
-        const x = r[0] | 0, y = r[1] | 0;
-        r[0] = Math.round(Math.atan2(y, x) * 0x8000 / Math.PI) & 0xffff;
-        r[0] = (r[0] << 16) >> 16;
-        return;
-      }
-      case 0x0b: this.cpuSet(r[0] >>> 0, r[1] >>> 0, r[2] >>> 0); return;
-      case 0x0c: this.cpuFastSet(r[0] >>> 0, r[1] >>> 0, r[2] >>> 0); return;
-      case 0x0d: r[0] = 0xbaae187f; return; // GetBiosChecksum (fixed real value)
-      case 0x0e: this.bgAffineSet(r[0] >>> 0, r[1] >>> 0, r[2] | 0); return;
-      case 0x0f: this.objAffineSet(r[0] >>> 0, r[1] >>> 0, r[2] | 0, r[3] | 0); return;
+      case 0x09: r[0] = arcTan(r[0]); return;
+      case 0x0a: r[0] = arcTan2(r[0], r[1]); return;
+      case 0x0b: this.cpuSet(r[0] >>> 0, r[1] >>> 0, r[2]); return;
+      case 0x0c: this.cpuFastSet(r[0] >>> 0, r[1] >>> 0, r[2]); return;
+      case 0x0d: r[0] = 0xbaae187f; return; // GetBiosChecksum
+      case 0x0e: this.bgAffineSet(r[0] >>> 0, r[1] >>> 0, r[2]); return;
+      case 0x0f: this.objAffineSet(r[0] >>> 0, r[1] >>> 0, r[2], r[3]); return;
       case 0x10: this.bitUnPack(r[0] >>> 0, r[1] >>> 0, r[2] >>> 0); return;
-      case 0x11: this.lz77(r[0] >>> 0, r[1] >>> 0, false); return;
-      case 0x12: this.lz77(r[0] >>> 0, r[1] >>> 0, true); return;
+      case 0x11: case 0x12: this.lz77(r[0] >>> 0, r[1] >>> 0); return;
       case 0x13: this.huffUnComp(r[0] >>> 0, r[1] >>> 0); return;
-      case 0x14: this.rlUnComp(r[0] >>> 0, r[1] >>> 0, false); return;
-      case 0x15: this.rlUnComp(r[0] >>> 0, r[1] >>> 0, true); return;
-      case 0x16: this.diffUnfilter(r[0] >>> 0, r[1] >>> 0, 1, false); return;
-      case 0x17: this.diffUnfilter(r[0] >>> 0, r[1] >>> 0, 1, true); return;
-      case 0x18: this.diffUnfilter(r[0] >>> 0, r[1] >>> 0, 2, false); return;
-      case 0x19: r[0] = 0x200; return; // SoundBias
+      case 0x14: case 0x15: this.rlUnComp(r[0] >>> 0, r[1] >>> 0); return;
+      case 0x16: case 0x17: this.diffUnFilter(r[0] >>> 0, r[1] >>> 0, 1); return;
+      case 0x18: this.diffUnFilter(r[0] >>> 0, r[1] >>> 0, 2); return;
       case 0x1f: this.midiKey2Freq(); return;
-      case 0x26: this.cpu.halted = true; return; // HardReset-adjacent / CustomHalt
-      case 0x27: r[0] = 0; return; // CustomHalt / others
-      // Sound-driver SWIs (0x1a-0x1e, 0x20-0x25) and misc: safe no-ops.
+      // SoundBias and the sound-driver calls (0x19-0x1e, 0x20-0x2a) have no
+      // effect worth modelling.
       default: return;
     }
   }
 
-  /** Called by the machine after each IRQ fires; resumes IntrWait. */
-  checkIntrWait(): void {
-    if (!this.intrWaiting) return;
-    const flags = this.rd16(0x03007ff8);
-    if ((flags & this.intrWaitFlags) !== 0) {
-      this.intrWaiting = false;
-      if (this.intrWaitDiscard) this.wr16(0x03007ff8, flags & ~this.intrWaitFlags);
-      this.cpu.halted = false;
-    }
-  }
+  // ---- system ---------------------------------------------------------------
 
-  private intrWait(discard: number, target: number): void {
-    const flags = this.rd16(0x03007ff8);
-    if (!discard && (flags & target) !== 0) return;
-    this.wr16(0x03007ff8, flags & ~target);
-    this.sys.ime = 1;
-    this.intrWaitFlags = target;
-    this.intrWaitDiscard = discard;
-    this.intrWaiting = true;
-    this.cpu.halted = true;
+  /** Blocks until one of `flags` shows up in the BIOS interrupt mirror at
+   *  0x03007FF8 (maintained by the IRQ shim). Blocking is done by halting
+   *  and re-running the SWI after each interrupt, like the BIOS's own loop. */
+  private intrWait(discardOld: boolean, flags: number): void {
+    const mirror = this.bus.peek16(0x03007ff8);
+    const resumed = this.waitFlags === flags;
+    if ((resumed || !discardOld) && mirror & flags) {
+      this.bus.poke16(0x03007ff8, mirror & ~flags);
+      this.waitFlags = 0;
+      return;
+    }
+    if (!resumed) this.bus.poke16(0x03007ff8, mirror & ~flags);
+    this.waitFlags = flags;
+    this.sys.enableMaster();
+    this.sys.halt();
+    this.cpu.restartInstruction();
   }
 
   private softReset(): void {
-    // Byte at 0x03007FFA selects EWRAM (nonzero) vs ROM entry.
-    const toRam = this.bus.peek16(0x03007ffa) & 0xff;
-    // Post-boot register state
-    for (let i = 0; i < 13; i++) this.cpu.r[i] = 0;
-    this.cpu.r[13] = 0x03007f00;
-    this.cpu.pc = toRam ? 0x02000000 : 0x08000000;
-    this.cpu.flush();
+    const toRam = this.bus.peek8(0x03007ffa) !== 0;
+    this.bus.iwram.fill(0, 0x7e00);
+    this.cpu.bootState(toRam ? 0x02000000 : 0x08000000);
   }
 
   private registerRamReset(flags: number): void {
     const b = this.bus;
     if (flags & 0x01) b.ewram.fill(0);
-    if (flags & 0x02) b.iwram.fill(0, 0, 0x7e00); // keep BIOS area
+    if (flags & 0x02) b.iwram.fill(0, 0, 0x7e00); // top 0x200 belongs to the BIOS
     if (flags & 0x04) b.pal.fill(0);
     if (flags & 0x08) b.vram.fill(0);
     if (flags & 0x10) b.oam.fill(0);
-    if (flags & 0x80) {
-      b.iwram.fill(0, 0, 0x7e00);
-      b.ewram.fill(0);
-    }
+    b.poke16(0x04000000, 0x0080);
   }
+
+  private div(num: number, den: number): void {
+    const r = this.cpu.r;
+    if (den === 0) {
+      // The real routine spins forever; hand back something harmless.
+      r[0] = num < 0 ? -1 : 1; r[1] = num; r[3] = 1;
+      return;
+    }
+    const q = (num / den) | 0;
+    r[0] = q; r[1] = num % den; r[3] = Math.abs(q);
+  }
+
+  // ---- memory copies ----------------------------------------------------------
 
   private cpuSet(src: number, dst: number, ctrl: number): void {
     const count = ctrl & 0x1fffff;
-    const word = (ctrl & 0x01000000) !== 0;   // 1 = 32-bit, 0 = 16-bit
-    const fixed = (ctrl & 0x02000000) !== 0;  // 1 = fill
-    if (word) {
-      const fill = this.rd32(src);
-      for (let i = 0; i < count; i++) {
-        this.wr32(dst + i * 4, fixed ? fill : this.rd32(src + i * 4));
-      }
+    const fixed = (ctrl & 0x01000000) !== 0;
+    const bus = this.bus;
+    if (ctrl & 0x04000000) {
+      src &= ~3; dst &= ~3;
+      for (let i = 0; i < count; i++) bus.poke32(dst + i * 4, bus.peek32(fixed ? src : src + i * 4));
     } else {
-      const fill = this.rd16(src);
-      for (let i = 0; i < count; i++) {
-        this.wr16(dst + i * 2, fixed ? fill : this.rd16(src + i * 2));
-      }
+      src &= ~1; dst &= ~1;
+      for (let i = 0; i < count; i++) bus.poke16(dst + i * 2, bus.peek16(fixed ? src : src + i * 2));
     }
   }
 
   private cpuFastSet(src: number, dst: number, ctrl: number): void {
-    let count = ctrl & 0x1fffff;
+    const count = ((ctrl & 0x1fffff) + 7) & ~7; // always whole 8-word blocks
     const fixed = (ctrl & 0x01000000) !== 0;
-    count = (count + 7) & ~7;
-    const fill = this.rd32(src);
-    for (let i = 0; i < count; i++) {
-      this.wr32(dst + i * 4, fixed ? fill : this.rd32(src + i * 4));
-    }
+    const bus = this.bus;
+    src &= ~3; dst &= ~3;
+    for (let i = 0; i < count; i++) bus.poke32(dst + i * 4, bus.peek32(fixed ? src : src + i * 4));
   }
 
-  private lz77(src: number, dst: number, vram: boolean): void {
-    const header = this.rd32(src);
-    let size = header >>> 8;
+  // ---- decompression ----------------------------------------------------------
+  // All formats start with a 32-bit header: type in the low byte, output
+  // size in the upper 24 bits.
+
+  private lz77(src: number, dst: number): void {
+    const bus = this.bus;
+    const end = dst + (bus.peek32(src) >>> 8);
     src += 4;
-    let out = 0;
-    while (out < size) {
-      const flags = this.bus.peek16(src) & 0xff;
-      src++;
-      for (let i = 0; i < 8 && out < size; i++) {
-        if (flags & (0x80 >>> i)) {
-          const b0 = this.bus.peek16(src) & 0xff;
-          const b1 = this.bus.peek16(src + 1) & 0xff;
-          src += 2;
-          const len = (b0 >>> 4) + 3;
-          const disp = ((b0 & 0xf) << 8) | b1;
-          for (let j = 0; j < len; j++) {
-            const b = this.readByte(dst + out - disp - 1);
-            this.writeByte(dst + out, b);
-            out++;
-          }
+    while (dst < end) {
+      const flags = bus.peek8(src++);
+      for (let bit = 0x80; bit && dst < end; bit >>= 1) {
+        if (flags & bit) {
+          const b0 = bus.peek8(src++), b1 = bus.peek8(src++);
+          const from = dst - ((((b0 & 0xf) << 8) | b1) + 1);
+          const len = (b0 >> 4) + 3;
+          for (let j = 0; j < len && dst < end; j++, dst++) bus.poke8(dst, bus.peek8(from + j));
         } else {
-          const b = this.bus.peek16(src) & 0xff;
-          src++;
-          this.writeByte(dst + out, b);
-          out++;
+          bus.poke8(dst++, bus.peek8(src++));
         }
       }
     }
   }
 
-  private readByte(addr: number): number {
-    const a = addr & ~1;
-    const w = this.rd16(a);
-    return (addr & 1) ? w >>> 8 : w & 0xff;
-  }
-
-  private writeByte(addr: number, v: number): void {
-    // Byte-accurate store via 16-bit rmw on non-VRAM-safe memories is fine
-    // for our purposes (VRAM byte writes mirror; LZ77Vram targets VRAM so
-    // write a halfword containing the byte in the low half).
-    const a = addr & ~1;
-    const cur = this.rd16(a);
-    this.wr16(a, (addr & 1) ? (cur & 0xff) | (v << 8) : (cur & 0xff00) | v);
-  }
-
-  private rlUnComp(src: number, dst: number, vram: boolean): void {
-    void vram;
-    const header = this.rd32(src);
-    let size = header >>> 8;
+  private rlUnComp(src: number, dst: number): void {
+    const bus = this.bus;
+    const end = dst + (bus.peek32(src) >>> 8);
     src += 4;
-    let out = 0;
-    while (out < size) {
-      const flag = this.bus.peek16(src) & 0xff;
-      src++;
+    while (dst < end) {
+      const flag = bus.peek8(src++);
       if (flag & 0x80) {
-        const count = (flag & 0x7f) + 3;
-        const b = this.bus.peek16(src) & 0xff;
-        src++;
-        for (let i = 0; i < count; i++) { this.writeByte(dst + out, b); out++; }
+        const byte = bus.peek8(src++);
+        for (let n = (flag & 0x7f) + 3; n > 0 && dst < end; n--) bus.poke8(dst++, byte);
       } else {
-        const count = (flag & 0x7f) + 1;
-        for (let i = 0; i < count; i++) {
-          this.writeByte(dst + out, this.bus.peek16(src) & 0xff);
-          src++;
-          out++;
-        }
+        for (let n = flag + 1; n > 0 && dst < end; n--) bus.poke8(dst++, bus.peek8(src++));
       }
     }
-    void size;
   }
 
   private huffUnComp(src: number, dst: number): void {
-    const header = this.rd32(src);
-    const size = header >>> 8;
-    const width = header & 0xf; // 4 or 8 bit symbols
-    src += 4;
-    const treeBase = src;
-    const treeSize = ((this.bus.peek16(src) & 0xff) / 2 + 1) * 2;
-    src += treeSize;
-    let out = 0;
-    let bits = 0;
-    let bitCount = 0;
-    while (out < size) {
-      if (bitCount === 0) {
-        bits = this.rd32(src);
-        src += 4;
-        bitCount = 32;
-      }
-      // Walk the huffman tree
-      let node = treeBase;
-      for (;;) {
-        const nodeVal = this.bus.peek16(node) & 0xff;
-        const bit = (bits >>> 31) & 1;
-        bits <<= 1;
-        bitCount--;
-        const childOff = node & ~1; // nodes are byte-sized; offset stored in high bits
-        const next = (nodeVal >>> (bit === 0 ? 6 : 4)) & 1; // end flags
-        const off = (nodeVal & 0x3f) * 2;
-        const childAddr = childOff + off + 2 + bit;
-        if (next) {
-          const sym = this.bus.peek16((childOff + off + 2) + bit * 0) & 0xff;
-          void sym;
-          // The child is at (node&~1) + offset*2 + 2 + bit
-          const c = this.bus.peek16(childAddr - 2 + 2) & 0xff;
-          void c;
-          const leafAddr = (node & ~1) + (nodeVal & 0x3f) * 2 + 2 + bit;
-          const v = this.bus.peek16(leafAddr) & 0xff;
-          if (width === 8) {
-            this.writeByte(dst + out, v);
-            out++;
-          } else {
-            // 4-bit symbols: two per byte
-            if (out & 1) {
-              const a = dst + (out & ~1);
-              const cur = this.rd16(a);
-              this.wr16(a, (cur & 0xff) | ((v & 0xf) << 8));
-            } else {
-              this.writeByte(dst + out, v & 0xf);
-            }
-            out++;
-          }
-          break;
+    const bus = this.bus;
+    const header = bus.peek32(src);
+    const width = header & 0xf;
+    let remaining = header >>> 8;
+    if (32 % width !== 0) return;
+    // Tree nodes are bytes: bits 0-5 offset to the children, bit 7 / bit 6
+    // flag the left / right child as a leaf.
+    const root = src + 5;
+    src += 5 + (bus.peek8(src + 4) << 1) + 1;
+    let nodeAddr = root;
+    let block = 0, filled = 0;
+    while (remaining > 0) {
+      let stream = bus.peek32(src);
+      src += 4;
+      for (let i = 0; i < 32 && remaining > 0; i++, stream <<= 1) {
+        const node = bus.peek8(nodeAddr);
+        const right = stream < 0 ? 1 : 0;
+        const child = (nodeAddr & ~1) + (node & 0x3f) * 2 + 2 + right;
+        if (!(node & (right ? 0x40 : 0x80))) { nodeAddr = child; continue; }
+        block |= (bus.peek8(child) & ((1 << width) - 1)) << filled;
+        filled += width;
+        nodeAddr = root;
+        if (filled === 32) {
+          bus.poke32(dst, block);
+          dst += 4; remaining -= 4;
+          block = filled = 0;
         }
-        node = childAddr;
       }
     }
   }
 
-  private diffUnfilter(src: number, dst: number, unit: 1 | 2, vram: boolean): void {
-    void vram;
-    const header = this.rd32(src);
-    const size = header >>> 8;
+  private diffUnFilter(src: number, dst: number, unit: 1 | 2): void {
+    const bus = this.bus;
+    const size = bus.peek32(src) >>> 8;
     src += 4;
-    if (unit === 1) {
-      let prev = 0;
-      for (let i = 0; i < size; i++) {
-        prev = (prev + (this.bus.peek16(src + i) & 0xff)) & 0xff;
-        this.writeByte(dst + i, prev);
-      }
-    } else {
-      let prev = 0;
-      for (let i = 0; i < size; i += 2) {
-        prev = (prev + this.rd16(src + i)) & 0xffff;
-        this.wr16(dst + i, prev);
+    let acc = 0;
+    for (let i = 0; i < size; i += unit) {
+      if (unit === 1) {
+        acc = (acc + bus.peek8(src + i)) & 0xff;
+        bus.poke8(dst + i, acc);
+      } else {
+        acc = (acc + bus.peek16(src + i)) & 0xffff;
+        bus.poke16(dst + i, acc);
       }
     }
   }
 
-  private bitUnPack(src: number, dst: number, infoAddr: number): void {
-    const srcLen = this.rd16(infoAddr);
-    const srcWidth = this.bus.peek16(infoAddr + 2) & 0xff;
-    const dstWidth = this.bus.peek16(infoAddr + 3) & 0xff;
-    const dstOff = this.rd32(infoAddr + 4) & 0x7fffffff;
-    const dstZeroFill = (this.rd32(infoAddr + 4) & 0x80000000) !== 0;
-    void dstZeroFill;
+  private bitUnPack(src: number, dst: number, info: number): void {
+    const bus = this.bus;
+    let srcLen = bus.peek16(info);
+    const srcWidth = bus.peek8(info + 2);
+    const dstWidth = bus.peek8(info + 3);
+    const offsetWord = bus.peek32(info + 4);
+    const bias = offsetWord & 0x7fffffff;
+    const biasZero = offsetWord > 0x7fffffff;
+    if (!srcWidth || !dstWidth) return;
 
-    let outBit = 0;
-    const mask = (1 << dstWidth) - 1;
-    for (let i = 0; i < srcLen; i++) {
-      const byte = this.bus.peek16(src + i) & 0xff;
-      for (let b = 0; b < 8; b += srcWidth) {
-        const v = (byte >>> b) & ((1 << srcWidth) - 1);
-        if (v === 0 && dstOff === 0) { outBit += dstWidth; continue; }
-        const value = v + dstOff;
-        // Write value at bit offset outBit
-        const byteOff = outBit >> 3;
-        const shift = outBit & 7;
-        const a = dst + byteOff;
-        const cur = this.rd16(a) | (this.rd16(a + 2) << 16);
-        const nv = (cur & ~(mask << shift)) | ((value & mask) << shift);
-        this.wr16(a, nv & 0xffff);
-        this.wr16(a + 2, (nv >>> 16) & 0xffff);
-        outBit += dstWidth;
+    let inByte = 0, inBits = 0, out = 0, outBits = 0;
+    while (srcLen > 0 || inBits > 0) {
+      if (inBits === 0) { inByte = bus.peek8(src++); inBits = 8; srcLen--; }
+      let v = inByte & ((1 << srcWidth) - 1);
+      inByte >>= srcWidth;
+      inBits -= srcWidth;
+      if (v || biasZero) v += bias;
+      out |= v << outBits;
+      outBits += dstWidth;
+      if (outBits >= 32) {
+        bus.poke32(dst, out);
+        dst += 4;
+        out = outBits = 0;
       }
     }
   }
+
+  // ---- affine helpers ---------------------------------------------------------
 
   private bgAffineSet(src: number, dst: number, count: number): void {
-    for (let i = 0; i < count; i++) {
-      const cx = this.rd32(src + i * 20) | 0;
-      const cy = this.rd32(src + i * 20 + 4) | 0;
-      const dispx = (this.rd16(src + i * 20 + 8) << 16) >> 16;
-      const dispy = (this.rd16(src + i * 20 + 10) << 16) >> 16;
-      const scaleX = this.rd32(src + i * 20 + 12) | 0;
-      const scaleY = this.rd32(src + i * 20 + 16) | 0;
-      const angle = this.rd16(src + i * 20 + 18) & 0xffff;
-
-      const theta = (angle >>> 8) * Math.PI / 128 + ((angle & 0xff) / 256) * Math.PI / 128;
-      const cos = Math.cos(theta);
-      const sin = Math.sin(theta);
-      const pa = Math.round(cos * scaleX / 256) | 0;
-      const pb = Math.round(-sin * scaleX / 256) | 0;
-      const pc = Math.round(sin * scaleY / 256) | 0;
-      const pd = Math.round(cos * scaleY / 256) | 0;
-      this.wr16(dst + i * 16, pa & 0xffff);
-      this.wr16(dst + i * 16 + 2, pb & 0xffff);
-      this.wr16(dst + i * 16 + 4, pc & 0xffff);
-      this.wr16(dst + i * 16 + 6, pd & 0xffff);
-      const dx = cx + (-pa * dispx - pb * dispy) / 256;
-      const dy = cy + (-pc * dispx - pd * dispy) / 256;
-      this.wr32(dst + i * 16 + 8, Math.round(dx));
-      this.wr32(dst + i * 16 + 12, Math.round(dy));
+    const bus = this.bus;
+    for (; count > 0; count--, src += 20, dst += 16) {
+      const ox = (bus.peek32(src) | 0) / 256, oy = (bus.peek32(src + 4) | 0) / 256;
+      const cx = s16(bus.peek16(src + 8)), cy = s16(bus.peek16(src + 10));
+      const sx = s16(bus.peek16(src + 12)) / 256, sy = s16(bus.peek16(src + 14)) / 256;
+      const theta = ((bus.peek16(src + 16) >> 8) / 128) * Math.PI;
+      const cos = Math.cos(theta), sin = Math.sin(theta);
+      const a = cos * sx, b = -sin * sx, c = sin * sy, d = cos * sy;
+      bus.poke16(dst, a * 256); bus.poke16(dst + 2, b * 256);
+      bus.poke16(dst + 4, c * 256); bus.poke16(dst + 6, d * 256);
+      bus.poke32(dst + 8, (ox - (a * cx + b * cy)) * 256);
+      bus.poke32(dst + 12, (oy - (c * cx + d * cy)) * 256);
     }
   }
 
-  private objAffineSet(src: number, dst: number, count: number, offset: number): void {
-    for (let i = 0; i < count; i++) {
-      const scaleX = this.rd32(src + i * 8) | 0;
-      const scaleY = this.rd32(src + i * 8 + 4) | 0;
-      const angle = this.rd16(src + i * 8 + 6) & 0xffff;
-      const theta = angle * Math.PI / 0x8000;
-      const cos = Math.cos(theta);
-      const sin = Math.sin(theta);
-      const pa = Math.round(cos * scaleX / 256) & 0xffff;
-      const pb = Math.round(-sin * scaleX / 256) & 0xffff;
-      const pc = Math.round(sin * scaleY / 256) & 0xffff;
-      const pd = Math.round(cos * scaleY / 256) & 0xffff;
-      const base = dst + i * offset;
-      this.wr16(base, pa);
-      this.wr16(base + 2, pb);
-      this.wr16(base + 4, pc);
-      this.wr16(base + 6, pd);
+  private objAffineSet(src: number, dst: number, count: number, stride: number): void {
+    const bus = this.bus;
+    for (; count > 0; count--, src += 8, dst += stride * 4) {
+      const sx = s16(bus.peek16(src)) / 256, sy = s16(bus.peek16(src + 2)) / 256;
+      const theta = ((bus.peek16(src + 4) >> 8) / 128) * Math.PI;
+      const cos = Math.cos(theta), sin = Math.sin(theta);
+      bus.poke16(dst, cos * sx * 256);
+      bus.poke16(dst + stride, -sin * sx * 256);
+      bus.poke16(dst + stride * 2, sin * sy * 256);
+      bus.poke16(dst + stride * 3, cos * sy * 256);
     }
   }
 
   private midiKey2Freq(): void {
     const r = this.cpu.r;
-    const wave = this.rd32(r[0] >>> 0);   // wave RAM pointer -> ignore content
-    void wave;
-    const key = r[1] | 0;
-    const fine = r[2] | 0;
-    // freq = 2^((key/16 + fine/256 - 13)/12 + ...) — approximate with the
-    // documented formula: result in 1/1024 semitone-ish fixed point.
-    const note = key / 16 + fine / 256;
-    r[0] = Math.round(Math.pow(2, (note - 45) / 12) * 32768 * 4096 / 16777216 * 1024);
+    const freq = this.bus.peek32((r[0] + 4) >>> 0);
+    r[0] = freq / Math.pow(2, (180 - r[1] - r[2] / 256) / 12);
   }
 
-  /** Apply post-BIOS register state so the machine can boot without one. */
-  applyPostBootState(): void {
-    const cpu = this.cpu;
-    cpu.cpsr = MODE_SYS | 0x00; // system mode, IRQ+FIQ enabled
-    cpu.r[0] = 0x08000000;
-    cpu.r[1] = 0x000000ea;
-    for (let i = 2; i <= 12; i++) cpu.r[i] = 0;
-    // Stacks per mode
-    cpu.r[13] = 0x03007f00;                    // usr/sys SP
-    // Switch to IRQ to set its SP, then SVC, then back to SYS.
-    cpu.writeCPSR(MODE_IRQ | 0x00, 0x1);
-    cpu.r[13] = 0x03007fa0;
-    cpu.writeCPSR(MODE_SVC | 0x00, 0x1);
-    cpu.r[13] = 0x03007fe0;
-    cpu.writeCPSR(MODE_SYS | 0x00, 0x1);
-    cpu.pc = 0x08000000;
-    (this.cpu as unknown as { flush: () => void }).flush();
+  saveState(w: StateWriter): void { w.u16(this.waitFlags); }
+  loadState(r: StateReader): void { this.waitFlags = r.u16(); }
+}
+
+function s16(v: number): number {
+  return (v << 16) >> 16;
+}
+
+/** The BIOS's polynomial arctangent: 1.14 fixed-point in, angle out. */
+function arcTan(i: number): number {
+  const a = -(Math.imul(i, i) >> 14);
+  let b = (Math.imul(0xa9, a) >> 14) + 0x390;
+  for (const k of [0x91c, 0xfb6, 0x16aa, 0x2081, 0x3651, 0xa2f9]) b = (Math.imul(b, a) >> 14) + k;
+  return Math.imul(i, b) >> 16;
+}
+
+function arcTan2(x: number, y: number): number {
+  if (y === 0) return x >= 0 ? 0 : 0x8000;
+  if (x === 0) return y >= 0 ? 0x4000 : 0xc000;
+  const yx = () => arcTan(((y << 14) / x) | 0);
+  const xy = () => arcTan(((x << 14) / y) | 0);
+  if (y >= 0) {
+    if (x >= 0) { if (x >= y) return yx(); }
+    else if (-x >= y) return yx() + 0x8000;
+    return 0x4000 - xy();
   }
+  if (x <= 0) { if (-x > -y) return yx() + 0x8000; }
+  else if (x >= -y) return yx() + 0x10000;
+  return 0xc000 - xy();
 }

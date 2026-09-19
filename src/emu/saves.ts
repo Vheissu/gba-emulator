@@ -1,278 +1,274 @@
-// Cartridge save hardware: SRAM, FLASH (64K/128K), EEPROM (512B/8K).
-// Detection is by version strings embedded in the ROM image, same scheme
-// the real SDK libraries use.
+// Cartridge save hardware: SRAM, Flash (64K/128K), EEPROM (512B/8K).
+// Detection is by the version strings the SDK save libraries embed in the
+// ROM image.
+
+import type { StateReader, StateWriter } from "./state";
 
 export type SaveKind = "none" | "sram" | "flash64" | "flash128" | "eeprom";
 
+const MARKERS: [string, SaveKind][] = [
+  ["EEPROM_V", "eeprom"],
+  ["FLASH1M_V", "flash128"],
+  ["FLASH512_V", "flash64"],
+  ["FLASH_V", "flash64"],
+  ["SRAM_V", "sram"],
+  ["SRAM_F_V", "sram"],
+];
+
 export function detectSaveKind(rom: Uint8Array): SaveKind {
-  // Scan for SDK save-library markers.
-  const len = Math.min(rom.length, 0x2000000);
-  let found: SaveKind = "none";
-  for (let i = 0; i + 12 < len; i += 4) {
-    // cheap pre-check on 'E','F','S'
+  // Library strings are word-aligned; pre-filter on the first letter.
+  for (let i = 0; i + 12 < rom.length; i += 4) {
     const c = rom[i];
     if (c !== 0x45 && c !== 0x46 && c !== 0x53) continue;
-    const s = String.fromCharCode(
-      rom[i], rom[i + 1], rom[i + 2], rom[i + 3], rom[i + 4],
-      rom[i + 5], rom[i + 6], rom[i + 7], rom[i + 8],
-    );
-    if (s.startsWith("EEPROM_V")) return "eeprom";
-    if (s.startsWith("FLASH1M_V")) return "flash128";
-    if (s.startsWith("FLASH512_V") || s.startsWith("FLASH_V")) found = "flash64";
-    else if (s.startsWith("SRAM_V")) found = "sram";
+    for (const [marker, kind] of MARKERS) {
+      let match = true;
+      for (let j = 0; j < marker.length && match; j++) {
+        match = rom[i + j] === marker.charCodeAt(j);
+      }
+      if (match) return kind;
+    }
   }
-  return found;
+  return "none";
 }
 
-export interface SaveDevice {
-  kind: SaveKind;
-  size: number;
-  data: Uint8Array;
-  read8(addr: number): number;
-  write8(addr: number, value: number): void;
-  // EEPROM bit-level interface
-  eepromRead(): number;
-  eepromWrite(value: number): void;
-  eepromAt(addr: number): boolean;
-  serialize(): Uint8Array;
-  deserialize(data: Uint8Array): void;
+export abstract class SaveDevice {
+  abstract readonly kind: SaveKind;
+  abstract data: Uint8Array;
+  /** Set whenever the backing memory changes; cleared by whoever persists it. */
+  dirty = false;
+
+  get isEeprom(): boolean { return false; }
+  /** Number of bytes worth persisting. */
+  get size(): number { return this.data.length; }
+
+  read8(_addr: number): number { return 0xff; }
+  write8(_addr: number, _value: number): void {}
+  eepromRead(): number { return 1; }
+  eepromWrite(_value: number): void {}
+  /** DMA3 word count of a transfer aimed at the EEPROM; reveals its size. */
+  eepromDmaHint(_count: number): void {}
+
+  /** Battery-backed contents, for persisting to disk. */
+  serialize(): Uint8Array { return this.data.slice(0, this.size); }
+  deserialize(d: Uint8Array): void {
+    this.data.set(d.subarray(0, this.data.length));
+    this.dirty = false;
+  }
+
+  saveState(w: StateWriter): void { w.blob(this.data); }
+  loadState(r: StateReader): void {
+    this.data.set(r.blob().subarray(0, this.data.length));
+    this.dirty = true;
+  }
 }
 
-class NoneSave implements SaveDevice {
-  kind: SaveKind = "none";
-  size = 0;
+class NoneSave extends SaveDevice {
+  readonly kind = "none";
   data = new Uint8Array(0);
-  read8(): number { return 0xff; }
-  write8(): void {}
-  eepromRead(): number { return 1; }
-  eepromWrite(): void {}
-  eepromAt(): boolean { return false; }
-  serialize(): Uint8Array { return this.data; }
-  deserialize(): void {}
 }
 
-export class SRAMSave implements SaveDevice {
-  kind: SaveKind = "sram";
-  size = 0x8000;
-  data = new Uint8Array(this.size).fill(0xff);
+class SramSave extends SaveDevice {
+  readonly kind = "sram";
+  data = new Uint8Array(0x8000).fill(0xff);
   read8(addr: number): number { return this.data[addr & 0x7fff]; }
-  write8(addr: number, value: number): void { this.data[addr & 0x7fff] = value & 0xff; }
-  eepromRead(): number { return 1; }
-  eepromWrite(): void {}
-  eepromAt(): boolean { return false; }
-  serialize(): Uint8Array { return this.data; }
-  deserialize(d: Uint8Array): void { this.data.set(d.subarray(0, this.size)); }
+  write8(addr: number, value: number): void {
+    this.data[addr & 0x7fff] = value;
+    this.dirty = true;
+  }
 }
 
-export class FlashSave implements SaveDevice {
-  kind: SaveKind;
-  size: number;
+const enum FlashCmd { Idle, Unlock1, Unlock2 }
+
+class FlashSave extends SaveDevice {
+  readonly kind: SaveKind;
   data: Uint8Array;
 
+  private cmd = FlashCmd.Idle;
   private idMode = false;
+  private erasePending = false;
+  private writePending = false;
+  private bankPending = false;
   private bank = 0;
-  private cmdState = 0; // 0 idle, 1 saw AA@5555, 2 saw 55@2AAA
-  private eraseArm = false;
-  private writeArm = false;
-  private bankArm = false;
 
-  constructor(kb: 64 | 128) {
-    this.kind = kb === 128 ? "flash128" : "flash64";
-    this.size = kb * 1024;
-    this.data = new Uint8Array(this.size).fill(0xff);
+  constructor(private large: boolean) {
+    super();
+    this.kind = large ? "flash128" : "flash64";
+    this.data = new Uint8Array(large ? 0x20000 : 0x10000).fill(0xff);
   }
 
   read8(addr: number): number {
-    addr &= 0xffff;
-    if (this.idMode) {
-      // Macronix IDs: 64K -> MX29LV512-ish (C2/BF... commonly 32/1B for 512K)
-      if (addr === 0) return this.size === 0x20000 ? 0xc2 : 0x32;
-      if (addr === 1) return this.size === 0x20000 ? 0x09 : 0x1b;
-      return 0;
+    if (this.idMode && addr < 2) {
+      // Macronix MX29L010 (128K) / Panasonic MN63F805MNP (64K)
+      if (this.large) return addr === 0 ? 0xc2 : 0x09;
+      return addr === 0 ? 0x32 : 0x1b;
     }
-    return this.data[this.bank * 0x10000 + addr];
+    return this.data[this.bank + addr];
   }
 
   write8(addr: number, value: number): void {
-    addr &= 0xffff;
-    value &= 0xff;
-    if (this.writeArm) {
-      this.writeArm = false;
-      this.data[this.bank * 0x10000 + addr] = value;
+    if (this.writePending) {
+      this.writePending = false;
+      this.data[this.bank + addr] = value;
+      this.dirty = true;
       return;
     }
-    if (this.bankArm) {
-      this.bankArm = false;
-      if (addr === 0 && this.size === 0x20000) this.bank = value & 1;
+    if (this.bankPending) {
+      this.bankPending = false;
+      if (addr === 0 && this.large) this.bank = (value & 1) << 16;
       return;
     }
-    if (this.eraseArm) {
-      this.eraseArm = false;
-      if (value === 0x30) {
-        // Sector erase: 4KB sector containing addr (or chip at 5555).
-        if (addr === 0x5555) {
-          this.data.fill(0xff);
-        } else {
-          const base = (this.bank * 0x10000 + addr) & ~0xfff;
-          this.data.fill(0xff, base, base + 0x1000);
-        }
-      }
-      return;
-    }
-    switch (this.cmdState) {
-      case 0:
-        if (addr === 0x5555 && value === 0xaa) this.cmdState = 1;
+    switch (this.cmd) {
+      case FlashCmd.Idle:
+        if (addr === 0x5555 && value === 0xaa) this.cmd = FlashCmd.Unlock1;
+        else if (value === 0xf0) this.idMode = false;
         return;
-      case 1:
-        if (addr === 0x2aaa && value === 0x55) this.cmdState = 2;
-        else this.cmdState = 0;
+      case FlashCmd.Unlock1:
+        this.cmd = addr === 0x2aaa && value === 0x55 ? FlashCmd.Unlock2 : FlashCmd.Idle;
         return;
-      case 2:
-        this.cmdState = 0;
-        if (addr === 0x5555) {
-          switch (value) {
-            case 0x90: this.idMode = true; return;
-            case 0xf0: this.idMode = false; return;
-            case 0x80: this.eraseArm = true; this.cmdState = 1; return; // needs AA/55/30 next
-            case 0xa0: this.writeArm = true; return;
-            case 0xb0: this.bankArm = true; return;
-          }
-        } else if (value === 0xf0) {
-          this.idMode = false;
-        }
+      case FlashCmd.Unlock2:
+        this.cmd = FlashCmd.Idle;
+        this.command(addr, value);
         return;
     }
   }
 
-  eepromRead(): number { return 1; }
-  eepromWrite(): void {}
-  eepromAt(): boolean { return false; }
-  serialize(): Uint8Array { return this.data; }
-  deserialize(d: Uint8Array): void { this.data.set(d.subarray(0, this.size)); }
+  private command(addr: number, value: number): void {
+    if (this.erasePending) {
+      this.erasePending = false;
+      if (value === 0x10 && addr === 0x5555) {
+        this.data.fill(0xff);
+        this.dirty = true;
+      } else if (value === 0x30) {
+        const base = this.bank + (addr & 0xf000);
+        this.data.fill(0xff, base, base + 0x1000);
+        this.dirty = true;
+      }
+      return;
+    }
+    if (addr !== 0x5555) return;
+    switch (value) {
+      case 0x90: this.idMode = true; return;
+      case 0xf0: this.idMode = false; return;
+      case 0x80: this.erasePending = true; return;
+      case 0xa0: this.writePending = true; return;
+      case 0xb0: this.bankPending = true; return;
+    }
+  }
+
+  saveState(w: StateWriter): void {
+    super.saveState(w);
+    w.u8(this.cmd); w.bool(this.idMode); w.bool(this.erasePending);
+    w.bool(this.writePending); w.bool(this.bankPending); w.u32(this.bank);
+  }
+
+  loadState(r: StateReader): void {
+    super.loadState(r);
+    this.cmd = r.u8(); this.idMode = r.bool(); this.erasePending = r.bool();
+    this.writePending = r.bool(); this.bankPending = r.bool(); this.bank = r.u32();
+  }
 }
 
-export class EepromSave implements SaveDevice {
-  kind: SaveKind = "eeprom";
-  size: number;
-  data: Uint8Array;
+/** Serial EEPROM. Commands are bit streams clocked in through DMA3:
+ *    read:  1 1 <addr> 0            then 4 dummy bits + 64 data bits out
+ *    write: 1 0 <addr> <64 data> 0  then "ready" (1) out
+ *  The address is 6 bits on the 512-byte part and 14 on the 8K part. */
+class EepromSave extends SaveDevice {
+  readonly kind = "eeprom";
+  data = new Uint8Array(0x2000).fill(0xff);
 
-  // Serial protocol state
-  private bits: number[] = [];
-  private state: "idle" | "read" | "written" = "idle";
-  private readQueue: number[] = [];
-  private addrBits = -1; // unknown until first command completes
-  
+  private addrBits = 14;
+  private sizeKnown = false;
+  private inBits = new Uint8Array(2 + 14 + 64 + 1);
+  private inCount = 0;
+  private outBits = new Uint8Array(68);
+  private outPos = 68;
 
-  constructor(large: boolean) {
-    this.size = large ? 8192 : 512;
-    this.data = new Uint8Array(this.size).fill(0xff);
-    this.addrBits = large ? 14 : 6;
+  get isEeprom(): boolean { return true; }
+  get size(): number { return this.addrBits === 6 ? 0x200 : 0x2000; }
+
+  eepromDmaHint(count: number): void {
+    if (this.sizeKnown) return;
+    if (count === 9 || count === 73) this.addrBits = 6;
+    else if (count === 17 || count === 81) this.addrBits = 14;
+    else return;
+    this.sizeKnown = true;
   }
 
-  read8(): number { return 0xff; }
-  write8(): void {}
-
-  eepromAt(addr: number): boolean {
-    return (addr & 0x0f000000) === 0x0d000000;
-  }
-
-  eepromWrite(value: number): void {
-    this.bits.push(value & 1);
-    // WRITE command completes when we have 2 + addrBits + 64 bits.
-    const need = 2 + this.addrBits + 64;
-    if (this.bits.length >= 2) {
-      const op = (this.bits[0] << 1) | this.bits[1];
-      if (op === 0b10 && this.bits.length === need) {
-        this.commitWrite();
-      } else if (op === 0b11 && this.bits.length === 2 + this.addrBits) {
-        this.commitRead();
-      } else if (this.bits.length > need + 8) {
-        // Stream desynced; reset.
-        this.bits = [];
-      }
+  deserialize(d: Uint8Array): void {
+    super.deserialize(d);
+    // A stored save tells us the chip size before the game does.
+    if (d.length === 0x200 || d.length === 0x2000) {
+      this.addrBits = d.length === 0x200 ? 6 : 14;
+      this.sizeKnown = true;
     }
   }
 
   eepromRead(): number {
-    if (this.state === "read") {
-      return this.readQueue.length ? this.readQueue.shift()! : 1;
-    }
-    if (this.state === "written") {
-      this.state = "idle";
-      return 1; // write finished
-    }
-    // A read with a pending command stream: try to complete it.
-    if (this.bits.length >= 2) {
-      const op = (this.bits[0] << 1) | this.bits[1];
-      const avail = this.bits.length - 2;
-      if (op === 0b11) {
-        // READ: infer address width from the bit count if unknown.
-        if (avail === 6 || avail === 14) {
-          this.addrBits = avail;
-          this.commitRead();
-          return this.readQueue.length ? this.readQueue.shift()! : 1;
-        }
-        if (avail === 2 + this.addrBits - 2) {
-          this.commitRead();
-          return this.readQueue.length ? this.readQueue.shift()! : 1;
-        }
-        // Unknown / partial -> guess by size
-        this.commitRead();
-        return this.readQueue.length ? this.readQueue.shift()! : 1;
-      }
-      if (op === 0b10) {
-        // WRITE terminated early by a read -> try both address widths.
-        if (avail === 6 + 64) { this.addrBits = 6; this.commitWrite(); }
-        else if (avail === 14 + 64) { this.addrBits = 14; this.commitWrite(); }
-        this.state = "written";
-        this.bits = [];
-        return 1;
-      }
-    }
-    this.bits = [];
-    return 1;
+    return this.outPos < this.outBits.length ? this.outBits[this.outPos++] : 1;
   }
 
-  private commitRead(): void {
-    const aBits = this.bits.length - 2;
-    let addr = 0;
-    for (let i = 0; i < aBits; i++) addr = (addr << 1) | this.bits[2 + i];
-    addr &= (this.data.length / 8) - 1;
-    this.readQueue = [0, 0, 0, 0];
-    for (let i = 7; i >= 0; i--) {
-      const b = this.data[addr * 8 + (7 - i)];
-      for (let bit = 7; bit >= 0; bit--) this.readQueue.push((b >>> bit) & 1);
+  eepromWrite(value: number): void {
+    const bits = this.inBits;
+    if (this.inCount === 0 && !(value & 1)) return; // commands start with a 1
+    bits[this.inCount++] = value & 1;
+    if (this.inCount < 2) return;
+    const header = 2 + this.addrBits;
+    if (bits[1]) {
+      if (this.inCount === header + 1) { this.beginRead(); this.inCount = 0; }
+    } else if (this.inCount === header + 65) {
+      this.commitWrite();
+      this.inCount = 0;
     }
-    this.state = "read";
-    this.bits = [];
+  }
+
+  private blockOffset(): number {
+    let addr = 0;
+    for (let i = 0; i < this.addrBits; i++) addr = (addr << 1) | this.inBits[2 + i];
+    return (addr & 0x3ff) * 8;
+  }
+
+  private beginRead(): void {
+    const off = this.blockOffset();
+    this.outBits.fill(0, 0, 4);
+    for (let i = 0; i < 64; i++) {
+      this.outBits[4 + i] = (this.data[off + (i >> 3)] >> (7 - (i & 7))) & 1;
+    }
+    this.outPos = 0;
   }
 
   private commitWrite(): void {
-    const aBits = this.bits.length - 2 - 64;
-    if (aBits !== 6 && aBits !== 14) { this.bits = []; return; }
-    let addr = 0;
-    for (let i = 0; i < aBits; i++) addr = (addr << 1) | this.bits[2 + i];
-    addr &= (this.data.length / 8) - 1;
-    const off = 2 + aBits;
+    const off = this.blockOffset();
+    const first = 2 + this.addrBits;
     for (let i = 0; i < 8; i++) {
       let b = 0;
-      for (let bit = 0; bit < 8; bit++) b = (b << 1) | this.bits[off + i * 8 + bit];
-      this.data[addr * 8 + i] = b;
+      for (let bit = 0; bit < 8; bit++) b = (b << 1) | this.inBits[first + i * 8 + bit];
+      this.data[off + i] = b;
     }
-    this.state = "written";
-    this.bits = [];
+    this.outPos = this.outBits.length; // reads now return "ready"
+    this.dirty = true;
   }
 
-  serialize(): Uint8Array { return this.data; }
-  deserialize(d: Uint8Array): void { this.data.set(d.subarray(0, this.size)); }
+  saveState(w: StateWriter): void {
+    super.saveState(w);
+    w.u8(this.addrBits); w.bool(this.sizeKnown);
+    w.bytes(this.inBits); w.u8(this.inCount);
+    w.bytes(this.outBits); w.u8(this.outPos);
+  }
+
+  loadState(r: StateReader): void {
+    super.loadState(r);
+    this.addrBits = r.u8(); this.sizeKnown = r.bool();
+    r.bytesInto(this.inBits); this.inCount = r.u8();
+    r.bytesInto(this.outBits); this.outPos = r.u8();
+  }
 }
 
-export function createSave(kind: SaveKind, romSize: number): SaveDevice {
+export function createSave(kind: SaveKind): SaveDevice {
   switch (kind) {
-    case "sram": return new SRAMSave();
-    case "flash64": return new FlashSave(64);
-    case "flash128": return new FlashSave(128);
-    case "eeprom": return new EepromSave(romSize > 16 * 1024 * 1024);
+    case "sram": return new SramSave();
+    case "flash64": return new FlashSave(false);
+    case "flash128": return new FlashSave(true);
+    case "eeprom": return new EepromSave();
     default: return new NoneSave();
   }
 }

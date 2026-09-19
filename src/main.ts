@@ -156,7 +156,8 @@ async function loadRom(data: Uint8Array, name: string): Promise<void> {
   romData = data;
   romName = name.replace(/\.[^.]+$/, "");
   romId = romKey(data);
-  const info = gba.loadRom(data, bios);
+  gba.setBios(bios);
+  const info = gba.loadRom(data);
 
   // Restore cartridge save memory if we have one stored.
   const stored = await idbGet<{ data: number[] }>("saves", romId);
@@ -228,7 +229,7 @@ addEventListener("pagehide", persistSaveRam);
 // Save states
 // ---------------------------------------------------------------------------
 
-interface SlotRec { state: ArrayBuffer; shot: string; ts: number; }
+interface SlotRec { state: Uint8Array; shot: string; ts: number; }
 
 const thumbCanvas = document.createElement("canvas");
 thumbCanvas.width = 120; thumbCanvas.height = 80;
@@ -429,7 +430,8 @@ pauseBtn.addEventListener("click", () => {
 });
 resetBtn.addEventListener("click", async () => {
   if (!romData) return;
-  gba.loadRom(romData, bios);
+  gba.setBios(bios);
+  gba.loadRom(romData);
   const stored = await idbGet<{ data: number[] }>("saves", romId);
   if (stored && gba.save.size > 0) gba.save.deserialize(Uint8Array.from(stored.data));
   paused = false;

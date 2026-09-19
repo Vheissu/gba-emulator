@@ -10,9 +10,6 @@ const skip = parseInt(skipArg || "0", 10);
 const gba = new GBA();
 gba.loadRom(new Uint8Array(readFileSync(romPath!)));
 
-const rname = (i: number) => "r" + i;
-void rname;
-
 let count = 0;
 while (count < max) {
   const pc = gba.cpu.pc;
@@ -30,11 +27,6 @@ while (count < max) {
       break;
     }
   }
-  const before = gba.cycles;
-  gba.cpu.step();
-  const elapsed = gba.cycles - before;
-  gba.sys.advance(elapsed);
-  gba.ppu.advance(elapsed);
-  gba.apu.advance(elapsed);
+  gba.step();
   count++;
 }
