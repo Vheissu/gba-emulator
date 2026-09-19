@@ -1,7 +1,8 @@
-// Minimal promise wrapper over IndexedDB. Stores: roms, saves, states, meta.
+// Minimal promise wrapper over IndexedDB.
+// Stores: roms (image bytes), library (per-ROM metadata), saves, states, meta.
 
 const DB_NAME = "agb-emu";
-const DB_VERSION = 1;
+const DB_VERSION = 2;
 
 let dbp: Promise<IDBDatabase> | null = null;
 
@@ -11,7 +12,7 @@ function open(): Promise<IDBDatabase> {
       const req = indexedDB.open(DB_NAME, DB_VERSION);
       req.onupgradeneeded = () => {
         const db = req.result;
-        for (const name of ["roms", "saves", "states", "meta"]) {
+        for (const name of ["roms", "library", "saves", "states", "meta"]) {
           if (!db.objectStoreNames.contains(name)) db.createObjectStore(name);
         }
       };

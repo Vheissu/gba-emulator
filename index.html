@@ -21,7 +21,7 @@
         <span id="fps" class="chip chip-fps">-- fps</span>
       </div>
       <input id="biosInput" type="file" accept=".bin" hidden />
-      <input id="romInput" type="file" accept=".gba,.agb,.bin" hidden />
+      <input id="romInput" type="file" accept=".gba,.agb,.bin,.zip" hidden />
     </header>
 
     <main class="stage">
@@ -36,7 +36,7 @@
         </div>
         <button id="dropzone" class="slot" type="button">
           <span class="slot-mouth"></span>
-          <span id="slotHint" class="slot-hint">DROP A .GBA FILE &nbsp;·&nbsp; CLICK TO BROWSE</span>
+          <span id="slotHint" class="slot-hint">DROP A .GBA OR .ZIP &nbsp;·&nbsp; CLICK TO BROWSE</span>
         </button>
       </div>
 
@@ -91,41 +91,74 @@
       <div class="deck">
         <button id="pauseBtn"  class="dbtn" type="button" disabled>PAUSE</button>
         <button id="resetBtn"  class="dbtn" type="button" disabled>RESET</button>
+        <button id="rewindBtn" class="dbtn" type="button" disabled title="Hold to rewind (Backspace)">REWIND</button>
         <button id="speedBtn"  class="dbtn" type="button" disabled>1× SPEED</button>
-        <button id="crtBtn"    class="dbtn" type="button">CRT: ON</button>
+        <button id="shotBtn"   class="dbtn" type="button" disabled title="Save a screenshot (F8)">SCREENSHOT</button>
         <button id="fsBtn"     class="dbtn" type="button">FULLSCREEN</button>
         <button id="ejectBtn"  class="dbtn dbtn-warn" type="button" disabled>EJECT</button>
       </div>
 
-      <!-- Manual-style panels -->
       <section class="panels">
+        <div class="panel-col">
         <div class="panel">
           <h2>Controls</h2>
-          <ul class="keymap">
-            <li><span class="keys"><kbd>↑</kbd><kbd>←</kbd><kbd>↓</kbd><kbd>→</kbd></span><span>D-Pad</span></li>
-            <li><span class="keys"><kbd>X</kbd></span><span>A button</span></li>
-            <li><span class="keys"><kbd>Z</kbd></span><span>B button</span></li>
-            <li><span class="keys"><kbd>A</kbd><kbd>S</kbd></span><span>L / R</span></li>
-            <li><span class="keys"><kbd>↵</kbd></span><span>Start</span></li>
-            <li><span class="keys"><kbd>⇧</kbd></span><span>Select</span></li>
+          <ul id="keymap" class="keymap"></ul>
+          <p class="panel-note">Click a key to rebind it. <button id="keysReset" class="link" type="button">Restore defaults</button></p>
+          <ul class="keymap keymap-fixed">
             <li><span class="keys"><kbd>Space</kbd></span><span>Fast-forward (hold)</span></li>
-            <li><span class="keys"><kbd>F1</kbd> <kbd>F2</kbd></span><span>Quick save / load</span></li>
+            <li><span class="keys"><kbd>⌫</kbd></span><span>Rewind (hold)</span></li>
+            <li><span class="keys"><kbd>F1</kbd><kbd>F2</kbd></span><span>Quick save / load</span></li>
+            <li><span class="keys"><kbd>P</kbd><kbd>M</kbd><kbd>F8</kbd></span><span>Pause / mute / screenshot</span></li>
           </ul>
-          <p class="panel-note">Any standard gamepad works: south&nbsp;=&nbsp;B, east&nbsp;=&nbsp;A, shoulders&nbsp;=&nbsp;L/R.</p>
+          <p class="panel-note">Gamepads work as soon as you press a button: south&nbsp;=&nbsp;B, east&nbsp;=&nbsp;A, shoulders&nbsp;=&nbsp;L/R.</p>
         </div>
-
+        </div>
+        <div class="panel-col">
         <div class="panel">
           <h2>Save states</h2>
           <div id="stateSlots" class="slots">
             <p class="panel-note">Insert a cartridge to use save states.</p>
           </div>
         </div>
-
+        <div class="panel">
+          <h2>Cartridge save</h2>
+          <p id="batteryInfo" class="panel-note">No cartridge inserted.</p>
+          <div class="row">
+            <button id="savExport" class="mini" type="button" disabled>EXPORT .SAV</button>
+            <button id="savImport" class="mini" type="button" disabled>IMPORT .SAV</button>
+          </div>
+          <p class="panel-note">In-game saves are written to this browser automatically. Export one to move it to another emulator or a flash cart.</p>
+          <input id="savInput" type="file" accept=".sav,.srm" hidden />
+        </div>
+        </div>
+        <div class="panel-col">
         <div class="panel">
           <h2>Library</h2>
           <div id="library" class="library">
             <p class="panel-note">ROMs you load are kept in this browser.</p>
           </div>
+        </div>
+        <div class="panel">
+          <h2>Display &amp; sound</h2>
+          <label class="range">
+            <span>Volume</span>
+            <input id="optVolume" type="range" min="0" max="100" step="1" />
+          </label>
+          <label class="opt"><input id="optCrt" type="checkbox" /><span>Scanline overlay</span></label>
+          <label class="opt"><input id="optColor" type="checkbox" /><span>Original LCD colours</span></label>
+          <label class="opt"><input id="optGhosting" type="checkbox" /><span>LCD ghosting <small>steadies flicker transparency</small></span></label>
+          <label class="opt"><input id="optSmoothing" type="checkbox" /><span>Smooth scaling</span></label>
+          <label class="opt"><input id="optRewind" type="checkbox" /><span>Keep rewind history <small>uses about 70&nbsp;MB</small></span></label>
+        </div>
+        <div class="panel">
+          <h2>Cheats</h2>
+          <textarea id="cheatText" class="cheats" rows="4" spellcheck="false" placeholder="02000000:63&#10;03001234:03E7" disabled></textarea>
+          <div class="row">
+            <button id="cheatApply" class="mini" type="button" disabled>APPLY</button>
+            <span id="cheatStatus" class="panel-note"></span>
+          </div>
+          <p class="panel-note">Raw RAM writes (<code>address:value</code>), reapplied every frame and remembered per game.</p>
+        </div>
         </div>
       </section>
     </main>
